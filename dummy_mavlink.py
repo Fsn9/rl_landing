@@ -1,14 +1,15 @@
 from pymavlink import mavutil
 from math import isclose
 import time
-from .controllers import *
+from .controller import load_controller
 
 import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--mission', type=str, required=False, default='land')
 parser.add_argument('--takeoff_altitude', type=float, required=False, default=6.0)
-# parser.add_argument('--animation', action="store_true")
+parser.add_argument('--control_period', type=float, required=False, default=3.0)
+parser.add_argument('--controller', type=str, required=False, choices=['dummy','dqn'], default='dummy')
 ap = parser.parse_args()
 
 THRUSTER_RF = 1
@@ -99,7 +100,7 @@ It checks altitude each 500ms
 Reaching tolerance is 0.3m by default
 @TODO put timeout and quit
 """
-def wait_altitude(connection, altitude, tolerance=0.3):
+def wait_altitude(connection, altitude, tolerance=0.4):
     print('Waiting for altitude reaching')
     while True:
         cur_alt = get_gps_position(connection).relative_alt / 1e3
@@ -164,7 +165,7 @@ def set_autopilot(connection, turn_on=True):
         set_servo_function(THRUSTER_LB, DISABLE_FUNCTION, connection)
         print('Turned off autopilot')
 
-def control_vel_mission(connection, controller):
+def control_vel_mission(connection, controller, control_period = 3.0):
     """ Set guided """
     set_mode(connection, 'GUIDED')
 
@@ -174,22 +175,20 @@ def control_vel_mission(connection, controller):
     """ Takeoff """
     takeoff(connection, altitude=3, block=True)
 
-    """ Turn off autopilot """
-    set_autopilot(connection, False)
+    """ Get controller """
+    controller = load_controller(controller)
 
+    """ Start control cycle """
     try:
         while True:
             """ Send commands """
-            rf, lf, rb, lb = random_controller()
+            controller()
 
             """ Set pace """
-            time.sleep(1) # 1 second
+            time.sleep(control_period)
             
     except KeyboardInterrupt:
             print('Interrupted mission')
-
-            """ Turn on autopilot """
-            set_autopilot(connection, True)
 
 def main():
     """ Start connection with vehicle """
@@ -204,7 +203,7 @@ def main():
     if ap.mission == "land": land_mission(connection)
 
     """ Control mission """
-    if ap.mission == "control_vel": control_vel_mission(connection, controller=random_controller)
+    if ap.mission == "control_vel": control_vel_mission(connection, controller=ap.controller, control_period=ap.control_period)
 
 if __name__ == '__main__':
     main()
