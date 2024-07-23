@@ -14,7 +14,9 @@ import torch
 
 import numpy as np
 
-from random import randint
+from random import randint, random
+
+from .action_spaces import *
 
 """
 class ROS2Controller that has:
@@ -48,11 +50,11 @@ class ROS2Controller(Node):
 
     def pose_cb(self, msg):
         self.cur_position = np.array([msg.pose.position.x,msg.pose.position.y,msg.pose.position.z])
-        self.get_logger().info('I heard position.x: "%s"' % msg.pose.position.x)
+        self.get_logger().info('I heard position.x: "%s"' % msg.pose.position)
     
     def gps_cb(self, msg):
-        self.cur_gps = np.array([msg.pose.position.x,msg.pose.position.y,msg.pose.position.z])
-        self.get_logger().info('I heard gps altitude: "%s"' % msg.position.altitude)
+        self.cur_gps = np.array([msg.position.latitude,msg.position.longitude,msg.position.altitude])
+        self.get_logger().info('I heard gps altitude: "%s"' % msg.position)
 
     # def action_pub(self):
     #     msg = TwistStamped()
@@ -69,7 +71,8 @@ class ROS2Controller(Node):
 
         msg.twist.linear.x = vx
         msg.twist.linear.y = vy
-        msg.twist.linear.z = 1.0 if self.i % 2 == 0 else -1.0
+        #msg.twist.linear.z = 1.0 if self.i % 2 == 0 else -1.0
+        msg.twist.linear.z = vz
         
         self.i += 1
 
@@ -136,6 +139,9 @@ class DQN(ROS2Controller):
         self.maximum_distance_landing_target = 8
         self.landing_target_position = np.random.randint(0,self.maximum_distance_landing_target,size=3).tolist()
 
+        self.action_space = simple_actions
+        self.action_space_len = len(simple_actions)
+
         self.spin() # spin callbacks to get data from topics
         self.state = self.make_state()
         print(self.state)
@@ -150,20 +156,27 @@ class DQN(ROS2Controller):
     returns a torch.tensor of the difference between the current pose and the landing target position
     """
     def make_state(self):
-        print(self.landing_target_position)
-        print(self.cur_position)
         return torch.tensor(self.cur_position - self.landing_target_position).float()
+    
+    def e_greedy(self, state):
+        if random() > self.epsilon: # exploit
+            print('Exploiting')
+            return torch.argmax(self.main_net(state).detach().cpu().numpy(), axis = 1)[0] # get argmax
+            #return actions.astype(np.float64) # because ros2 accepts only float64 in velocity fields
+        else: # explore
+            print('Exploring')
+            return randint(0, self.action_space_len - 1)
+            
 
     def __call__(self):
         """ 1. Observe """
         state = self.make_state()
 
         """ 2. Act """
-        self.actions = self.main_net(state).detach().cpu().numpy() # call network
-        self.actions = self.actions.astype(np.float64) # because ros2 accepts only float64 in velocity fields
-        super().__call__(self.actions[0], self.actions[1], self.actions[2]) # send actions to ROS simulator
+        action = self.e_greedy(state)
+        super().__call__(*self.action_space[action]) # send actions to ROS simulator
 
-        """ 2. Store experience """
+        """ 3. Store experience """
         #self.store(state, action, next_state, reward)
 
 """
