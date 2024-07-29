@@ -84,6 +84,7 @@ class ROS2Controller(Node):
 
 class RL:
     def __init__(self):
+        self.cumulative_reward = 0
         pass
 
     def learn(self):
@@ -142,6 +143,17 @@ class DQN(ROS2Controller):
         self.action_space = simple_actions
         self.action_space_len = len(simple_actions)
 
+        """ Metrics """
+        self.counter_steps = 0
+        self.MAX_STEPS = 30
+        self.MAX_X = 8
+        self.MAX_Y = 8
+        self.MAX_Z = 8
+        self.cumulative_reward = 0
+        self.CRITICAL_HEIGHT_MIN = 1
+        self.CRITICAL_HEIGHT_MAX = 8
+        self.LANDED_ALLOWED_DIAMETER = 1 # TODO should be the diameter of the platform
+
         self.spin() # spin callbacks to get data from topics
         self.state = self.make_state()
         print(self.state)
@@ -149,8 +161,8 @@ class DQN(ROS2Controller):
     def decay_epsilon(self):
         self.epsilon = max(self.epsilon_decay * self.episode_counter + self.epsilon_i, self.epsilon_f)
     
-    def store(self, cur_state, action, next_state, reward):
-        self.memory.store(cur_state, action, next_state, reward)
+    def store(self, cur_state, action, next_state, reward, terminated):
+        self.memory.store(cur_state, action, next_state, reward, terminated)
     
     """
     returns a torch.tensor of the difference between the current pose and the landing target position
@@ -162,13 +174,53 @@ class DQN(ROS2Controller):
         if random() > self.epsilon: # exploit
             print('Exploiting')
             return torch.argmax(self.main_net(state).detach().cpu().numpy(), axis = 1)[0] # get argmax
-            #return actions.astype(np.float64) # because ros2 accepts only float64 in velocity fields
+
         else: # explore
             print('Exploring')
             return randint(0, self.action_space_len - 1)
-            
+    
+    def compute_reward(self, state, action, next_state, termination):
+        terminated, reason = termination[0], termination[1]
+        dx, dy, dz = abs(next_state[0]) - abs(state[0]), abs(next_state[1]) - abs(state[1]), abs(next_state[2]) - abs(state[2])
+        
+        if reason == "landed":
+            return 2
+        elif reason == "crashed":
+            return -2
+        else:
+            # TODO falta normalizar, ou seja descobrir o MAX_DZ, MAX_DY, MAX_DX
+            reward_sum = 0
+            reward_sum += 0.33 * (1 - 2 * (dx >= 0)) # incentivizes approaching in x
+            reward_sum += 0.33 * (1 - 2 * (dy >= 0)) # incentivizes approaching in y
+            reward_sum += 0.33 * (1 - 2 * (dz >= 0)) # incentivizes approaching in z
+            return reward_sum
+    
+    """ Returns if terminated flag and the reason """
+    def terminated(self, state, action, next_state):
+        x_pos, y_pos, z_pos = self.cur_position[0], self.cur_position[1], self.cur_position[2] # get positions
+
+        # if max steps
+        if self.counter_steps > self.MAX_STEPS:
+            return True, "max_steps"
+        
+        # if out of allowed area
+        if x_pos > self.MAX_X or y_pos > self.MAX_Y or z_pos > self.MAX_Z:
+            return True, "outside"
+        
+        # if crashed
+        if z_pos < self.CRITICAL_HEIGHT_MIN and x_pos > self.LANDED_ALLOWED_DIAMETER and y_pos > self.LANDED_ALLOWED_DIAMETER:
+            return True, "crashed"
+        
+        # if landed
+        if z_pos < self.CRITICAL_HEIGHT_MIN and x_pos < self.LANDED_ALLOWED_DIAMETER and y_pos < self.LANDED_ALLOWED_DIAMETER:
+            return True, "landed"
+
+        return False, "none"
 
     def __call__(self):
+        """ Update some metric variables """
+        self.counter_steps += 1
+
         """ 1. Observe """
         state = self.make_state()
 
@@ -176,8 +228,30 @@ class DQN(ROS2Controller):
         action = self.e_greedy(state)
         super().__call__(*self.action_space[action]) # send actions to ROS simulator
 
-        """ 3. Store experience """
-        #self.store(state, action, next_state, reward)
+        """ 3. Spin again to get next state """
+        self.spin()
+
+        """ 4. Get next state """
+        next_state = self.make_state()
+
+        """ Check termination """
+        termination = self.terminated(state, action, next_state)
+
+        """ 5. Get reward """
+        reward = self.compute_reward(state, action, next_state, termination)
+
+        """ 6. Store experience """
+        self.store(state, action, next_state, reward, termination)
+
+        """ Update some metric values """
+        self.cumulative_reward += reward
+
+        print('state: ', state)
+        print('action: ', action)
+        print('next state: ', next_state)
+        print('reward: ', reward)
+        print('termination: ', termination)
+        print()
 
 """
 Dummy method
