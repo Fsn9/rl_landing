@@ -12,6 +12,8 @@ from .replay_memory import ReplayMemory
 
 import torch
 
+import torch.optim as optim
+
 import numpy as np
 
 from random import randint, random
@@ -125,23 +127,29 @@ class DQN(ROS2Controller):
         self.episode_counter = 0
         self.final_episode_epsilon_decay = int(0.9 * self.max_episodes) # on this episode, epsilon stays constant until the end
 
-        self.input_size = 3
-        self.output_size = 3
+        self.action_space = simple_actions
+        self.action_space_len = len(simple_actions)
 
-        self.main_net = OneLayerMLP(self.input_size,self.output_size)
-        
-        self.target_net = OneLayerMLP(self.input_size,self.output_size)
+        self.input_size = 3
+        self.output_size = self.action_space_len
+
+        """ Initialize neural nets setup """
+        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self.main_net = OneLayerMLP(self.input_size,self.output_size).to(self.device)
+        self.target_net = OneLayerMLP(self.input_size,self.output_size).to(self.device)
+        self.target_net.load_state_dict(self.main_net.state_dict()) # Copy behaviour policy's weights to target net
+        self.tau = 0.001
+        self.optimizer = optim.AdamW(self.main_net.parameters(), lr=self.alpha, amsgrad=True)
+        self.criterion = nn.MSELoss()
 
         self.epsilon_decay = -self.epsilon_i / self.final_episode_epsilon_decay
         
         self.memory_capacity = 1000
-        self.memory = ReplayMemory(self.memory_capacity)
+        self.batch_size = 8
+        self.memory = ReplayMemory(self.memory_capacity, self.batch_size)
 
         self.maximum_distance_landing_target = 8
         self.landing_target_position = np.random.randint(0,self.maximum_distance_landing_target,size=3).tolist()
-
-        self.action_space = simple_actions
-        self.action_space_len = len(simple_actions)
 
         """ Metrics """
         self.counter_steps = 0
@@ -161,8 +169,8 @@ class DQN(ROS2Controller):
     def decay_epsilon(self):
         self.epsilon = max(self.epsilon_decay * self.episode_counter + self.epsilon_i, self.epsilon_f)
     
-    def store(self, cur_state, action, next_state, reward, terminated):
-        self.memory.store(cur_state, action, next_state, reward, terminated)
+    def store(self, cur_state, action, reward, next_state, terminated):
+        self.memory.store(cur_state, action, reward, next_state, terminated)
     
     """
     returns a torch.tensor of the difference between the current pose and the landing target position
@@ -173,14 +181,15 @@ class DQN(ROS2Controller):
     def e_greedy(self, state):
         if random() > self.epsilon: # exploit
             print('Exploiting')
-            return torch.argmax(self.main_net(state).detach().cpu().numpy(), axis = 1)[0] # get argmax
+            with torch.no_grad(): # disables gradient computation (requires_grad=False)
+                return torch.argmax(self.main_net(state).detach().cpu().numpy(), axis = 1)[0] # get argmax
 
         else: # explore
             print('Exploring')
-            return randint(0, self.action_space_len - 1)
+            return torch.randint(0, self.action_space_len, (1,))
     
     def compute_reward(self, state, action, next_state, termination):
-        terminated, reason = termination[0], termination[1]
+        _, reason = termination[0], termination[1]
         dx, dy, dz = abs(next_state[0]) - abs(state[0]), abs(next_state[1]) - abs(state[1]), abs(next_state[2]) - abs(state[2])
         
         if reason == "landed":
@@ -201,22 +210,79 @@ class DQN(ROS2Controller):
 
         # if max steps
         if self.counter_steps > self.MAX_STEPS:
-            return True, "max_steps"
+            return torch.tensor(True), "max_steps"
         
         # if out of allowed area
         if x_pos > self.MAX_X or y_pos > self.MAX_Y or z_pos > self.MAX_Z:
-            return True, "outside"
+            return torch.tensor(True), "outside"
         
         # if crashed
         if z_pos < self.CRITICAL_HEIGHT_MIN and x_pos > self.LANDED_ALLOWED_DIAMETER and y_pos > self.LANDED_ALLOWED_DIAMETER:
-            return True, "crashed"
+            return torch.tensor(True), "crashed"
         
         # if landed
         if z_pos < self.CRITICAL_HEIGHT_MIN and x_pos < self.LANDED_ALLOWED_DIAMETER and y_pos < self.LANDED_ALLOWED_DIAMETER:
-            return True, "landed"
+            return torch.tensor(True), "landed"
 
-        return False, "none"
+        return torch.tensor(False), "none"
+    
+    def learn(self):
+        if len(self.memory) < self.batch_size:
+            print('Not enough samples to learn')
+            return
+        
+        mini_batch = self.memory.sample()
 
+        state_batch = []
+        action_batch = []
+        next_state_batch = []
+        reward_batch = []
+        termination_batch = []
+        for interaction in mini_batch:
+            state_batch.append(interaction.cur_state)
+            action_batch.append(interaction.action)
+            next_state_batch.append(interaction.next_state)
+            reward_batch.append(interaction.reward)
+            termination_batch.append(interaction.termination[0])
+        state_batch = torch.stack(state_batch, dim=0).to(self.device)
+        action_batch = torch.stack(action_batch, dim=0).to(self.device)
+        reward_batch = torch.stack(reward_batch, dim=0).to(self.device)
+        termination_batch = torch.stack(termination_batch, dim=0).to(self.device)
+        termination_batch[0] = True # TODO remove
+        non_terminated_idxs = (termination_batch == False).nonzero().squeeze() # squeeze because it delivers (B,1). I want (B,)
+
+        """ Get Qs """
+        # The idea is feeding the *state* from the batch and then select the Q according to the *action* taken
+        predicted_qs = self.main_net(state_batch)
+        selected_qs = torch.gather(predicted_qs, dim=1, index=action_batch) # selected action values according to batch
+        
+        """ Get Q targets """
+        next_qs = torch.zeros(self.batch_size).to(device=self.device) # max
+        with torch.no_grad():
+            target_qs = self.target_net(state_batch[non_terminated_idxs]) # this variable is useful to create just for interpretability
+            next_qs[non_terminated_idxs] = target_qs.max(1).values # assign max qs to idxs of non terminal states. the others remain equal to zero.
+
+        """ Compute loss """
+        # The update is Q = Q + alpha * (r + gamma * max Q - Q)
+        td_target = reward_batch + self.gamma * next_qs
+        loss = self.criterion(selected_qs, td_target.unsqueeze(1)) # target shape (8) to (8,1)
+        self.optimizer.zero_grad()
+        loss.backward()
+
+        """ Gradient clipping """
+        #torch.nn.utils.clip_grad_value_(self.main_net.parameters(), 100) # clip gradients between 100 and -100
+        torch.nn.utils.clip_grad_norm_(self.main_net.parameters(), 100) # clip and normalize gradients for threshold
+
+        """ Update weights """
+        self.optimizer.step()
+
+        """ Soft update the target """
+        target_net_state_dict = self.target_net.state_dict() # copy
+        main_net_state_dict = self.main_net.state_dict() # copy
+        for key in main_net_state_dict:
+            target_net_state_dict[key] = main_net_state_dict[key] * self.tau + (1 - self.tau) * target_net_state_dict[key]
+        self.target_net.load_state_dict(target_net_state_dict) # copy soft updated weights
+        
     def __call__(self):
         """ Update some metric variables """
         self.counter_steps += 1
@@ -226,7 +292,7 @@ class DQN(ROS2Controller):
 
         """ 2. Act """
         action = self.e_greedy(state)
-        super().__call__(*self.action_space[action]) # send actions to ROS simulator
+        super().__call__(*self.action_space[action.item()]) # send actions to ROS simulator
 
         """ 3. Spin again to get next state """
         self.spin()
@@ -241,10 +307,13 @@ class DQN(ROS2Controller):
         reward = self.compute_reward(state, action, next_state, termination)
 
         """ 6. Store experience """
-        self.store(state, action, next_state, reward, termination)
+        self.store(state, action, reward, next_state, termination)
 
         """ Update some metric values """
         self.cumulative_reward += reward
+
+        """ 7. Learn """
+        self.learn()
 
         print('state: ', state)
         print('action: ', action)
