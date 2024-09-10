@@ -5,6 +5,10 @@ from .controller import load_controller
 
 import argparse
 
+from random import randint
+
+import wandb
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--mission', type=str, required=False, default='land')
 parser.add_argument('--takeoff_altitude', type=float, required=False, default=6.0)
@@ -100,13 +104,17 @@ It checks altitude each 500ms
 Reaching tolerance is 0.3m by default
 @TODO put timeout and quit
 """
-def wait_altitude(connection, altitude, tolerance=0.4):
+def wait_altitude(connection, altitude, tolerance=0.5):
     print('Waiting for altitude reaching')
+    st_timeout = time.time()
     while True:
         cur_alt = get_gps_position(connection).relative_alt / 1e3
         print(f'Remaining distance to target altitude: {round(abs(cur_alt-altitude),ndigits=3)}')
         if isclose(cur_alt, altitude, abs_tol=tolerance):
             print(f'Altitude of {cur_alt} reached!')
+            return
+        elif (time.time() - st_timeout) > 15:
+            print('Timeout of altitude check exceeded, finished takeoff. ')
             return
         time.sleep(0.5)
 
@@ -144,6 +152,7 @@ def takeoff_mission(connection, altitude):
 def land_mission(connection):
     """ Set guided """
     set_mode(connection, 'LAND')
+    connection.motors_disarmed_wait() # TODO change for some check that landed instead of check of disarmed
 
 def set_thrusters(connection, rf_pwm, lf_pwm, rb_pwm, lb_pwm):
     connection.mav.send(thruster_cmd(THRUSTER_RF, rf_pwm, connection))
@@ -182,12 +191,18 @@ def control_vel_mission(connection, controller, control_period = 3.0):
     try:
         while True:
             """ Send commands """
-            controller()
+            status = controller()
+            if status[0].item(): # if terminated episode from controller, restart UAV to new position
+                print('Ended episode. Resetting UAV to a new pose.')
+                land_mission(connection)
+                takeoff_mission(connection, altitude=randint(1,7)) # put random height and position
 
             """ Set pace """
-            time.sleep(control_period)
+            time.sleep(control_period) # TODO check if state changed instead of periodic control
             
     except KeyboardInterrupt:
+            controller.finish()
+            land_mission(connection)
             print('Interrupted mission')
 
 def main():
