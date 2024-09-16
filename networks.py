@@ -37,3 +37,39 @@ class TwoLayerMLP(nn.Module):
     def forward(self, x):
         logits = self.layers(x)
         return logits
+
+class neural_network(nn.Module):
+    '''
+    Feedforward neural network with variable number
+    of hidden layers and ReLU nonlinearites
+    '''
+
+    def __init__(self,
+                layers,
+                # layers[0] = input layer
+                # layers[i] = # of neurons at i-th layer
+                # layers[-1] = output layer
+                dropout=False,
+                p_dropout=0.2,
+                ):
+        super(neural_network,self).__init__()
+
+        self.network_layers = []
+        n_layers = len(layers)
+        for i,neurons_in_current_layer in enumerate(layers[:-1]):
+            
+            self.network_layers.append(nn.Linear(neurons_in_current_layer,
+                                                layers[i+1]) )
+            
+            if dropout:
+                self.network_layers.append( nn.Dropout(p=p_dropout) )
+
+            if i < n_layers - 2:
+                self.network_layers.append( nn.ReLU() )
+        
+        self.network_layers = nn.Sequential(*self.network_layers)
+
+    def forward(self,x):
+        for layer in self.network_layers:
+            x = layer(x)
+        return x
