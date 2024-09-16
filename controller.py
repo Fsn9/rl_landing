@@ -3,8 +3,12 @@ from rclpy.node import Node
 
 from std_msgs.msg import String
 
-from geometry_msgs.msg import TwistStamped, PoseStamped
+from geometry_msgs.msg import TwistStamped, PoseStamped, Pose
 from geographic_msgs.msg import GeoPointStamped
+
+from gz.msgs10.pose_pb2 import Pose as PosePB2
+from gz.msgs10.boolean_pb2 import Boolean as BooleanPB2
+import gz.transport13 as transport13
 
 from .networks import *
 
@@ -57,6 +61,31 @@ class ROS2Controller(Node):
         self.cur_gps = None
 
         self.i = 0
+        
+        self.node_set_gz_pose = transport13.Node()
+        
+    """ Gazebo set model service"""
+    def set_gz_model_pose(self, name, pose):
+        # Service request message
+        req = PosePB2()
+        req.name = "artuga_0"
+        req.position.x = pose[0]
+        req.position.y = pose[1]
+        req.position.z = pose[2]
+        req.orientation.w = 1.0
+        req.orientation.x = 0.0
+        req.orientation.y = 0.0
+        req.orientation.z = 0.0
+
+        result, response = self.node_set_gz_pose.request("/world/map/set_pose", req, PosePB2, BooleanPB2, timeout=10)
+
+        print(f'Marker set to position:\n{req.position}')
+        
+        if result:
+            print(f"Service call was successful. {result}")
+            print(f"Response: {response}")
+        else:
+            print("Service call failed.")
     
     def spin(self):
         rclpy.spin_once(self)
@@ -184,9 +213,10 @@ class DQN(RL):
         self.batch_size = 8
         self.memory = ReplayMemory(self.memory_capacity, self.batch_size)
 
+        # TODO: this should be detached from DQN class
         self.maximum_distance_landing_target = 8
-        self.landing_target_position = np.random.randint(0,self.maximum_distance_landing_target,size=3).tolist()
-        self.landing_target_position[2] = 0
+        self.landing_target_position = np.random.randint(0,self.maximum_distance_landing_target,size=3).astype(float).tolist()
+        self.landing_target_position[2] = 0.0
 
         """ Metrics """
         self.counter_steps = 0
@@ -210,7 +240,9 @@ class DQN(RL):
 
         self.spin() # spin callbacks to get data from topics
         self.state = self.make_state()
-        print(self.state)
+        print('Initial state:', self.state)
+
+        self.reset()
 
     def decay_epsilon(self):
         self.epsilon = max(self.epsilon_decay * self.num_episodes + self.epsilon_i, self.epsilon_f)
@@ -221,8 +253,8 @@ class DQN(RL):
     """ On end episode decay epsilon and resets landing target position """
     def reset(self):
         self.decay_epsilon()
-        self.landing_target_position = np.random.randint(0, self.maximum_distance_landing_target, size=3).tolist()
-        self.landing_target_position[2] = 0
+        self.landing_target_position = np.random.randint(-self.maximum_distance_landing_target//2, self.maximum_distance_landing_target//2, size=3).astype(float).tolist()
+        self.landing_target_position[2] = 0.0
         print(f'Reseting episode and new epsilon of {self.epsilon}')
     
     """
@@ -279,15 +311,15 @@ class DQN(RL):
             return torch.tensor(True), "max_steps"
         
         # if out of allowed area
-        if abs(x_pos) > self.MAX_X or abs(y_pos) > self.MAX_Y or z_pos > self.MAX_Z:
+        if abs(x_pos) > self.MAX_X or abs(y_pos) > self.MAX_Y or z_pos > self.MAX_Z or z_pos <= 0:
             return torch.tensor(True), "outside"
         
         # if crashed
-        if z_pos < self.CRITICAL_HEIGHT_MIN and abs(x_pos) > self.LANDED_ALLOWED_DIAMETER and abs(y_pos) > self.LANDED_ALLOWED_DIAMETER:
+        if (z_pos < self.CRITICAL_HEIGHT_MIN or z_pos <= 0) and ((abs(state[0]) > self.LANDED_ALLOWED_DIAMETER) or (abs(state[1]) > self.LANDED_ALLOWED_DIAMETER)):
             return torch.tensor(True), "crashed"
         
         # if landed
-        if z_pos < self.CRITICAL_HEIGHT_MIN and abs(x_pos) < self.LANDED_ALLOWED_DIAMETER and abs(y_pos) < self.LANDED_ALLOWED_DIAMETER:
+        if (z_pos < self.CRITICAL_HEIGHT_MIN) and (abs(state[0]) < self.LANDED_ALLOWED_DIAMETER) and (abs(state[1]) < self.LANDED_ALLOWED_DIAMETER):
             return torch.tensor(True), "landed"
 
         return torch.tensor(False), "none"
@@ -375,7 +407,6 @@ class DQN(RL):
             """ If distance covered is bigger than 0.1 or transition duration above 5 seconds """
             if distance_between_states >= 0.25 or (time.time() - state_start_time) >= 5:
                 break
-        # print('after spin: ', next_state)
 
         """ Check termination """
         termination = self.terminated(state, action, next_state)
@@ -402,13 +433,13 @@ class DQN(RL):
             self.counter_episodic_steps = 0 # reset counter episodic steps
 
             self.reset() # decays epsilon and new landing target
-            return termination
+            return (termination[0], termination[1], self.landing_target_position) # returns termination cause and new marker position
         
         if self.num_episodes == self.max_episodes:
             print('Ended Learning')
-            return termination
+            return (termination[0], termination[1], self.landing_target_position) # returns termination cause and new marker position
         
-        return termination # what returns if everything is ok
+        return (termination[0], termination[1], self.landing_target_position) # returns termination cause and new marker position # what returns if everything is ok
 
 """
 Dummy method

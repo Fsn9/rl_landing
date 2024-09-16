@@ -185,16 +185,21 @@ def control_vel_mission(connection, controller, control_period = 3.0):
     takeoff(connection, altitude=3, block=True)
 
     """ Get controller """
-    controller = load_controller(controller)
+    controller = load_controller(controller) # Start controller
+    controller.set_gz_model_pose("artuga_0", controller.landing_target_position) # Set artuga to new position
 
     """ Start control cycle """
     try:
         while True:
-            """ Send commands """
-            status = controller()
-            if status[0].item(): # if terminated episode from controller, restart UAV to new position
-                print('Ended episode. Resetting UAV to a new pose.')
+            """ Call controller, meaning, rolling an RL interaction """
+            report = controller() # report return has e.g., (episode ended: bool, ending cause: landed, new_target_pose: np.array)
+            if report[0].item(): # if terminated episode from controller, restart UAV to new position
+                print('Ended episode. Resting UAV and marker')
+
+                controller.set_gz_model_pose('artuga_0', report[2])
+
                 land_mission(connection)
+
                 takeoff_mission(connection, altitude=randint(1,7)) # put random height and position
 
             """ Set pace """
