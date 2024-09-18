@@ -19,7 +19,7 @@ writer = SummaryWriter(log_dir=f"Reward_size_{str(GRID_RESOL)}")
 
 device = torch.device("cpu")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(device)
+print('device:', device)
 
 class agent_base():
 

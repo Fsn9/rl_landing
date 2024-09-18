@@ -9,12 +9,30 @@ from random import randint
 
 import wandb
 
+""" Parsing arguments """
 parser = argparse.ArgumentParser()
 parser.add_argument('--mission', type=str, required=False, default='land')
 parser.add_argument('--takeoff_altitude', type=float, required=False, default=6.0)
 parser.add_argument('--control_period', type=float, required=False, default=3.0)
-parser.add_argument('--controller', type=str, required=False, choices=['dummy','dqn'], default='dummy')
+parser.add_argument('--controller_name', type=str, required=False, choices=['dummy','dqn'], default='dummy')
+parser.add_argument('--train', action='store_true', help = "It trains from scratch or trains from given model if --resume is True")
+parser.add_argument('--test', action='store_true', help = "It tests the given model")
+parser.add_argument('--resume', action='store_true', help="It resumes training of provided model in --model")
+parser.add_argument('--model', type=str, required=False, default='', help="This is the path to the model")
+
 ap = parser.parse_args()
+
+if ap.mission == "control_vel":
+    if ap.train: 
+        ap.test = False
+        if ap.resume and not ap.model:
+            print('Not a provided model to resume. Fill the flag --model [PATH_TO_MODEL] with the model to resume training')
+            exit()
+    elif ap.test:
+        ap.train = False
+        if not ap.model:
+            print('Not a provided model to test. Fill the flag --model [PATH_TO_MODEL] with the model to test')
+            exit()
 
 THRUSTER_RF = 1
 THRUSTER_LF = 2
@@ -87,6 +105,31 @@ def arm(connection):
             break
     print('Vehicle armed!')
 
+def disarm(connection, timeout=15):
+    st = time.time()
+    """ Start loop of waiting for disarm """
+    while True:
+        m = connection.wait_heartbeat()
+        if not connection.motors_armed():
+            print('Disarmed!')
+            return
+        elif (time.time() - st) > timeout: 
+            """ If time exceeds and not disarmed, break the loop and send command manually """
+            break
+
+    """ If did not disarm, send disarm command """
+    connection.mav.command_long_send(
+    connection.target_system,    # target_system
+    connection.target_component, # target_component
+    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, # Command
+    0,                           # Confirmation
+    0,                           # Disarm (param1)
+    0, 0, 0, 0, 0, 0             # Unused parameters
+    )
+
+    ack = connection.recv_match(type='COMMAND_ACK', blocking=True)
+    print("After sending manual disarm command, ACK received: %s" % ack)
+
 """ 
 Blocks until received mavlink message of type GLOBAL_POSITION_INT.
 As args it is the mavlink connection object.
@@ -152,7 +195,8 @@ def takeoff_mission(connection, altitude):
 def land_mission(connection):
     """ Set guided """
     set_mode(connection, 'LAND')
-    connection.motors_disarmed_wait() # TODO change for some check that landed instead of check of disarmed
+    #connection.motors_disarmed_wait() # TODO change for some check that landed instead of check of disarmed
+    disarm(connection, timeout=15)
 
 def set_thrusters(connection, rf_pwm, lf_pwm, rb_pwm, lb_pwm):
     connection.mav.send(thruster_cmd(THRUSTER_RF, rf_pwm, connection))
@@ -174,7 +218,8 @@ def set_autopilot(connection, turn_on=True):
         set_servo_function(THRUSTER_LB, DISABLE_FUNCTION, connection)
         print('Turned off autopilot')
 
-def control_vel_mission(connection, controller, control_period = 3.0):
+# TODO change to RL precise landing mission
+def control_vel_mission(connection, controller_name, control_period = 3.0):
     """ Set guided """
     set_mode(connection, 'GUIDED')
 
@@ -185,7 +230,7 @@ def control_vel_mission(connection, controller, control_period = 3.0):
     takeoff(connection, altitude=3, block=True)
 
     """ Get controller """
-    controller = load_controller(controller) # Start controller
+    controller = load_controller(controller_name, ap.train, ap.test, ap.resume, ap.model) # Start controller
     controller.set_gz_model_pose("artuga_0", controller.landing_target_position) # Set artuga to new position
 
     """ Start control cycle """
@@ -194,7 +239,7 @@ def control_vel_mission(connection, controller, control_period = 3.0):
             """ Call controller, meaning, rolling an RL interaction """
             report = controller() # report return has e.g., (episode ended: bool, ending cause: landed, new_target_pose: np.array)
             if report[0].item(): # if terminated episode from controller, restart UAV to new position
-                print('Ended episode. Resting UAV and marker')
+                print('Ended episode. Resetting UAV and marker')
 
                 controller.set_gz_model_pose('artuga_0', report[2])
 
@@ -223,7 +268,7 @@ def main():
     if ap.mission == "land": land_mission(connection)
 
     """ Control mission """
-    if ap.mission == "control_vel": control_vel_mission(connection, controller=ap.controller, control_period=ap.control_period)
+    if ap.mission == "control_vel": control_vel_mission(connection, controller_name=ap.controller_name, control_period=ap.control_period)
 
 if __name__ == '__main__':
     main()

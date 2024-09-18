@@ -10,9 +10,9 @@ from gz.msgs10.pose_pb2 import Pose as PosePB2
 from gz.msgs10.boolean_pb2 import Boolean as BooleanPB2
 import gz.transport13 as transport13
 
-from .networks import *
+from rl_landing.networks import OneLayerMLP
 
-from .replay_memory import ReplayMemory
+from rl_landing.replay_memory import ReplayMemory
 
 import torch
 
@@ -31,6 +31,8 @@ import time
 import calendar
 
 import wandb
+
+import os
 
 from rl_landing.agent import *
 from rl_landing.illegal_actions import IllegalActions
@@ -85,7 +87,7 @@ class ROS2Controller(Node):
         print(f'Marker set to position:\n{req.position}')
         
         if result:
-            print(f"Service call was successful. {result}")
+            print(f"Service call was successful.")
             print(f"Response: {response}")
         else:
             print("Service call failed.")
@@ -141,6 +143,26 @@ class RL(ROS2Controller):
             project="rl_landing",
             config=self.config,
         )
+
+        """ Initialize revelant paths """
+        self._wd_path = os.getcwd() # working directory
+        self._pkg_path = os.path.join('src','rl_landing','rl_landing')
+
+        """ Initializes results dir if not existent """
+        self._results_path = os.path.join(self._pkg_path,'results')
+        if not os.path.exists(self._results_path):
+            os.mkdir(self._results_path)
+        
+        """ Initializes current results dir """
+        self._log_path = os.path.join(self._results_path, "results" + "_" + timestamp)
+        os.mkdir(self._log_path)
+
+        """ Initializes model paths """
+        self._last_model_path = os.path.join(self._log_path, "last.pth")
+        self._best_model_path = os.path.join(self._log_path, "best.pth")
+        self._last_target_model_path = os.path.join(self._log_path, "last_target.pth")
+        self._best_target_model_path = os.path.join(self._log_path, "best_target.pth")
+
     
     def finish(self):
         print('Finishing RL process')
@@ -173,7 +195,17 @@ class RL(ROS2Controller):
 DQN method
 """
 class DQN(RL):
-    def __init__(self):
+    def __init__(self, controller_name, train, test, resume, model): # *args comes with (controller_name: str, train: bool, test: bool, resume: bool, model: str)
+        """ Args disambiguation """
+        print('Args given: ', controller_name, train, test, resume, model)
+        self.name = controller_name
+        self.to_train = train
+        self.to_test = test
+        self.to_resume = resume
+        self.model_path = model
+        self.best_target_model_path = self.model_path.replace("best", "best_target")
+        self.last_target_model_path = self.model_path.replace("best", "last_target")
+
         # initalizes DQN offline or online
         ## if offline, does not initalize ROS stuff because it will learn from offline data
         self.alpha = 0.00025
@@ -193,7 +225,7 @@ class DQN(RL):
             'final_episode_epsilon_decay': self.final_episode_epsilon_decay,
         } # This will be the config in wandb init
 
-        super().__init__('dqn')
+        super().__init__(self.name)
 
         self.action_space = simple_actions
         self.action_space_len = len(simple_actions)
@@ -201,11 +233,13 @@ class DQN(RL):
         self.input_size = 3
         self.output_size = self.action_space_len
 
-        """ Initialize neural nets setup """
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+        """ Initialize neural nets setup """
         self.main_net = OneLayerMLP(self.input_size,self.output_size).to(self.device)
         self.target_net = OneLayerMLP(self.input_size,self.output_size).to(self.device)
         self.target_net.load_state_dict(self.main_net.state_dict()) # Copy behaviour policy's weights to target net
+
         self.tau = 0.001
         self.optimizer = optim.AdamW(self.main_net.parameters(), lr=self.alpha, amsgrad=True)
         self.criterion = nn.MSELoss()
@@ -215,6 +249,34 @@ class DQN(RL):
         self.memory_capacity = 1000
         self.batch_size = 8
         self.memory = ReplayMemory(self.memory_capacity, self.batch_size)
+
+        """ If test or resume args active, load models """
+        if self.model_path:
+            self.loaded_model = torch.load(self.model_path, weights_only=False) # This loads object
+            self.main_net.load_state_dict(self.loaded_model['model_state_dict'])
+            print(f'Loaded main model ({self.model_path})')
+
+            self.loaded_target_model = torch.load(self.best_target_model_path, weights_only=False)
+            self.target_net.load_state_dict(self.loaded_target_model['model_state_dict'])
+            print(f'Loaded target model ({self.best_target_model_path})')
+            
+            self.optimizer.load_state_dict(self.loaded_model['optimizer_state_dict'])
+            print(f'Loaded optimizer model ({self.optimizer})')
+
+            exit()
+
+            #self.loaded_optimizer = torch.load(self.model_path, weights_only=True)
+
+        # if self.to_test:
+        #     self.main_net.load_state_dict(self.loaded_model['model_state_dict'])
+        #     print(f'Loaded main model ({self.model_path}) to test')
+        # if self.to_resume:
+        #     self.main_net.load_state_dict(self.loaded_model['model_state_dict'])
+        #     print(f'Loaded main model ({self.model_path}) to resume')
+        #     self.target_net.load_state_dict(self.loaded_target_model['model_state_dict'])
+        #     print(f'Loaded target model ({self.target_model_path}) to resume')
+        #     self.optimizer.load_state_dict(self.loaded_model['optimizer_state_dict'])
+        #     print(f'Loaded optimizer model ({self.optimizer}) to resume')
 
         # TODO: this should be detached from DQN class
         self.maximum_distance_landing_target = 8
@@ -235,9 +297,10 @@ class DQN(RL):
         self.LANDED_ALLOWED_DIAMETER = 1 # TODO should be the diameter of the platform
         self.num_crashes = 0
         self.num_landings = 0
+        self.max_reward = -1000
 
         global timestamp
-        with open('metrics_' + timestamp + '.csv', 'w', newline='') as metrics_file:
+        with open(os.path.join(self._log_path, 'metrics_' + timestamp + '.csv'), 'w', newline='') as metrics_file:
             writer = csv.writer(metrics_file)
             writer.writerow(['Avg reward','Num landings','Num crashes'])
 
@@ -299,11 +362,12 @@ class DQN(RL):
         global timestamp
         """ CSV log """
         avg_reward = (self.cumulative_reward / self.counter_steps).item()
-        with open('metrics_' + timestamp + '.csv', 'a', newline='') as metrics_file:
+        with open(os.path.join(self._log_path, 'metrics_' + timestamp + '.csv'), 'a', newline='') as metrics_file:
             writer = csv.writer(metrics_file)
             writer.writerow([avg_reward,self.num_landings,self.num_crashes])
         """ Wandb log """
         self.run.log({"avg reward": avg_reward, "num_landings": self.num_landings, "num_crashes": self.num_crashes, "epsilon": self.epsilon})
+        return avg_reward
 
     """ Returns if terminated flag and the reason """
     def terminated(self, state, action, next_state):
@@ -383,8 +447,11 @@ class DQN(RL):
         for key in main_net_state_dict:
             target_net_state_dict[key] = main_net_state_dict[key] * self.tau + (1 - self.tau) * target_net_state_dict[key]
         self.target_net.load_state_dict(target_net_state_dict) # copy soft updated weights
-        
-    def __call__(self):
+
+    def test(self):
+        raise NotImplementedError
+
+    def train(self):
         """ Update some metric variables """
         self.counter_steps += 1
         self.counter_episodic_steps += 1
@@ -430,10 +497,40 @@ class DQN(RL):
         """ 9. If so, reset episode"""
         if termination[0].item(): # If episode ended
             """ 9.1. Log metrics """
-            self.log_metrics() # log avg reward, num crashes, num lands, epsilon
+            avg_reward = self.log_metrics() # log avg reward, num crashes, num lands, epsilon
 
             self.num_episodes += 1 # increment num of episodes
             self.counter_episodic_steps = 0 # reset counter episodic steps
+
+            """ 9.2. Save last model """
+            """ Save main policy """
+            torch.save({
+            'episode': self.counter_episodic_steps,
+            'model_state_dict': self.main_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            }, self._last_model_path)
+
+            """ Save target policy """
+            torch.save({
+            'episode': self.counter_episodic_steps,
+            'model_state_dict': self.target_net.state_dict(),
+            }, self._last_target_model_path)
+
+            """ 9.3. Save best model if reward is the best """
+            if avg_reward > self.max_reward:
+                """ Save main policy """
+                torch.save({
+                'episode': self.counter_episodic_steps,
+                'model_state_dict': self.main_net.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                }, self._best_model_path)
+
+                """ Save target policy """
+                torch.save({
+                'episode': self.counter_episodic_steps,
+                'model_state_dict': self.target_net.state_dict(),
+                }, self._best_target_model_path)
+                self.max_reward = avg_reward
 
             self.reset() # decays epsilon and new landing target
             return (termination[0], termination[1], self.landing_target_position) # returns termination cause and new marker position
@@ -443,6 +540,12 @@ class DQN(RL):
             return (termination[0], termination[1], self.landing_target_position) # returns termination cause and new marker position
         
         return (termination[0], termination[1], self.landing_target_position) # returns termination cause and new marker position # what returns if everything is ok
+    
+    def __call__(self):
+        if self.to_train:
+            return self.train()
+        else:
+            return self.test()
 
 """ TODO where to put illegal actions """
 action_opposition_matrix = np.array([[0,1,0,0,0,0,0,1,1],
@@ -718,21 +821,20 @@ class dqn(agent_base):
                 + (1-self.target_net_update_tau)*dict_params2[name1].data)
         self.neural_networks['target_net'].load_state_dict(dict_params2)
 
-
 """
 Dummy method
 """
 class Dummy(ROS2Controller):
-    def __init__(self):
+    def __init__(self, controller_name, train, test, resume, model):
         super().__init__('dummy')
 
 """
 Main that inits and returns controller to mavlink module
 """
-def main(args):
+def main(controller_name, train, test, resume, model):
     rclpy.init(args=None)
 
-    controller = list_controllers[args]()
+    controller = list_controllers[controller_name](controller_name, train, test, resume, model)
 
     return controller
 
