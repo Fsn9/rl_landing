@@ -1,7 +1,7 @@
 #!/usr/bin/python
 
 from ros2_msg import *
-from environment_simple_test import *
+from environment_simple import *
 from controller import dqn
 from agent import *
 import matplotlib.pyplot as plt
@@ -26,7 +26,7 @@ def main(args=None):
     agent.load_state(state=input_dictionary)
 
     # Initialize environment
-    env = CustomEnv()
+    env = CustomEnv(mode='real')
     env.reset()
 
     durations = []

@@ -3,7 +3,7 @@
 from ros2_msg import *
 #from environment import *
 from environment_simple import *
-from rl_landing.controller import dqn
+from controller import dqn
 from agent import *
 import matplotlib.pyplot as plt
 import argparse
@@ -101,7 +101,7 @@ def train():
     """
     # Initialize the agent and environment
     agent = dqn()
-    env = CustomEnv()
+    env = CustomEnv(mode='simulation')
     env.reset()
 
     # Train the agent
@@ -136,7 +136,7 @@ def test():
     agent.load_state(state=input_dictionary)
 
     # Initialize environment
-    env = CustomEnv()
+    env = CustomEnv(mode='simulation')
     env.reset()
 
     # Evaluate the trained model

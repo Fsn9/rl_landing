@@ -1,6 +1,7 @@
 import gymnasium as gym
 from ros2_msg import *
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Range
 from geometry_msgs.msg import TwistStamped
 import subprocess
 import os
@@ -65,14 +66,19 @@ def state_changed(prev_state, current_state, action):
 
 class CustomEnv(gym.Env):
     """
-    Custom Gym Environment for a drone simulation using ROS2, Gazebo, and MAVROS.
-    This environment handles drone flight simulation, movement commands, and state updates.
+    Custom Gym Environment for drone flight. Supports both training (using ROS2, Gazebo, MAVROS) 
+    and real-world tests.
+    This environment handles drone flight, movement commands, and state updates.
     """
     
-    def __init__(self):
+    def __init__(self, mode='simulation'):
         """
         Initializes the environment by setting up ROS2 nodes, publishers, subscribers, 
-        and launching required external processes like Gazebo and ArduPilot.
+        and optionally launching Gazebo, ArduPilot, and other required components.
+        
+        Parameters:
+        mode (str): Specifies the environment mode. 
+                    'simulation' for training using Gazebo, and 'real' for real-world tests.
         """
         super(CustomEnv, self).__init__()
         
@@ -88,56 +94,75 @@ class CustomEnv(gym.Env):
         self.state = np.array([0, 0, 0], dtype=np.float32)
         self.crashed = False
         self.landed = False
+        self.inside = 0
         self.step_counter = 0
         self.eps = 0
-        self.inside = 0
         self.last_distance = float("inf")
+        self.previous_inside = None
+        self.previous_outside = None
 
         # Landing pad attributes
         self.landing_pad_position = np.array((0, 0, 0))  # Center position
         self.landing_pad_radius = 12.5  # Radius of the landing pad area
 
-        # Initialize ROS 2 publishers, subscribers, and services
-        self.move_command = GoToXYZ()
-        self.position_subscriber = self.node.create_subscription(Odometry, 'mavros/global_position/local', self.position_callback, qos_profile)
-        self.check_armed = CheckArmed()
+        # Common ROS 2 subscriber for position updates
+        self.position_subscriber = self.node.create_subscription(Odometry, 'mavros/global_position/local', 
+                                                                 self.position_callback, qos_profile)
 
-        # Launch external processes
-        self.launch_gazebo()
-        self.launch_ardupilot()
-        #self.launch_ros2_mavros()
+        # Mode-specific attributes (simulation vs real-world)
+        self.mode = mode
+        if self.mode == 'simulation':
+            # Initialize ROS 2 publishers, subscribers, and services
+            self.move_command = GoToXYZ()
+            self.check_armed = CheckArmed()
+            
+            # Launch external processes
+            self.launch_gazebo()
+            self.launch_ardupilot()
+            #self.launch_ros2_mavros()
+            
+            # Prepare the drone for flight
+            time.sleep(20)
+            self.prepare_flight()
+        
+        elif self.mode == 'real':
+            # Use real-world drone movement commands
+            self.move_command = GoToXYZ_vel()
 
-        # Prepare the drone for flight
-        time.sleep(20)
-        self.prepare_flight()
+            # Additional subscriber for altitude (Z) from the rangefinder in real-world mode
+            self.position_subscriber_Z = self.node.create_subscription(Range, 'mavros/rangefinder/rangefinder', 
+                                                                       self.position_callback_z, qos_profile)
+            time.sleep(2)
 
+        
     def prepare_flight(self):
         """
         Prepares the drone for flight by setting the mode to GUIDED, arming the throttle,
         and taking off to a specified altitude.
         """
-        # Set mode to GUIDED
-        serv_client_mode = SetModeGuided()
-        serv_client_mode.send_request()
-        serv_client_mode.destroy_node()
-        time.sleep(3)
+        if self.mode == 'simulation':
+            # Set mode to GUIDED
+            serv_client_mode = SetModeGuided()
+            serv_client_mode.send_request()
+            serv_client_mode.destroy_node()
+            time.sleep(3)
 
-        # Arm throttle
-        serv_client_armthrottle = ArmThrottle()
-        serv_client_armthrottle.send_request()
-        serv_client_armthrottle.destroy_node()
-        time.sleep(3)
+            # Arm throttle
+            serv_client_armthrottle = ArmThrottle()
+            serv_client_armthrottle.send_request()
+            serv_client_armthrottle.destroy_node()
+            time.sleep(3)
 
-        # Take off
-        serv_client_takeoff = Takeoff()
-        serv_client_takeoff.send_request()
-        serv_client_takeoff.destroy_node()
-        time.sleep(3)
+            # Take off
+            serv_client_takeoff = Takeoff()
+            serv_client_takeoff.send_request()
+            serv_client_takeoff.destroy_node()
+            time.sleep(3)
 
-        # Set initial position at altitude
-        self.set_init_pos = SetPosition()
-        self.set_init_pos.pub_msg([0.0, 0.0, 5.0])
-        time.sleep(3)
+            # Set initial position at altitude
+            self.set_init_pos = SetPosition()
+            self.set_init_pos.pub_msg([0.0, 0.0, 5.0])
+            time.sleep(3)
 
 
     def launch_gazebo(self):
@@ -167,22 +192,45 @@ class CustomEnv(gym.Env):
         Callback to update the current position of the drone from ROS Odometry data.
         """
         position = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z], dtype=np.float32)
-        self.state[:3] = position
-
+        if self.mode == 'simulation':
+            self.state[:3] = position
+        elif self.mode == 'real':
+            self.state[:2] = position
+    
+    def position_callback_z(self, msg):
+        """
+        Callback to update the altitude (Z-coordinate) from ROS rangefinder data.
+        Only used in real-world mode.
+        """
+        position = np.array([msg.range], dtype=np.float32)
+        self.state[2] = position[0] - 0.19#drone altitude offset
+        
     def reset(self):
         """
-        Resets the environment to an initial state with a random starting position.
+        Resets the environment to an initial state with a random starting position in simulation mode.
+        In real-world mode, waits for user input to reset the environment.
         Returns the initial state and an empty info dictionary.
         """
-        start_pos = [random.randint(-6, 6) + 0.0, random.randint(-6, 6) + 0.0, random.randint(4, 8) + 0.0]
-        self.set_init_pos.pub_msg(start_pos)
-        time.sleep(1)
+        if self.mode == 'simulation':
+            # Random starting position in simulation
+            start_pos = [random.randint(-6, 6) + 0.0, random.randint(-6, 6) + 0.0, random.randint(4, 8) + 0.0]
+            self.set_init_pos.pub_msg(start_pos)
+            time.sleep(1)
+
+        elif self.mode == 'real':
+            # Wait for user input in real-world tests
+            print("Waiting for reset in real-world mode -> Enter to start landing...")
+            input()
+
+            #offset, if needed
+            self.state[0] -= 0.00
+            self.state[1] -= -0.00
+            self.state[2] -= 0.0
 
         rclpy.spin_once(self.node)  # Spin the node to update the state
         self.state = [map_to_closest(num) for num in self.state]  # Map state to the closest grid resolution
 
         # Reset internal variables
-        self.last_distance = float("inf")
         self.inside = 0
         self.step_counter = 0
         self.eps += 1
@@ -199,14 +247,7 @@ class CustomEnv(gym.Env):
         Performs a step in the environment by executing the given action.
         Returns the updated state, reward, done flag, and additional info.
         """
-        
-        increment_count(self.state[0], self.state[1], self.state[2], action)
 
-        # Take action in the environment
-        reward = -50.0  # Placeholder reward
-        done = False  # Placeholder termination flag
-        info = {}     # Placeholder additional information
-        
         # Action-to-direction mapping
         actions = {
             0: 'left', 1: 'right', 2: 'forward', 3: 'backward',
@@ -214,23 +255,44 @@ class CustomEnv(gym.Env):
         }
         direction = actions.get(action)
 
-        # Move the drone in the specified direction
-        prev_state = self.state.copy()
-        while not state_changed(prev_state, self.state, action):
+
+        if self.mode == 'simulation':
+
+            increment_count(self.state[0], self.state[1], self.state[2], action)
+            
+            # Move the drone in the specified direction
+            prev_state = self.state.copy()
+            while not state_changed(prev_state, self.state, action):
+                if direction:
+                    self.move_command.pub_msg(self.state, direction)
+                rclpy.spin_once(self.node)
+                self.state = [map_to_closest(num) for num in self.state]
+        
+        elif self.mode == 'real':
+
             if direction:
                 self.move_command.pub_msg(self.state, direction)
             rclpy.spin_once(self.node)
             self.state = [map_to_closest(num) for num in self.state]
 
+            #offset
+            self.state[0] -= 0.00
+            self.state[1] -= -0.00
+            self.state[2] -= 0.0
 
-        #print("ROS State:", self.state)
-        distance_to_pad = np.linalg.norm(self.state - self.landing_pad_position)
+
+        # Take action in the environment
+        reward = -50.0  # Placeholder reward
+        done = False  # Placeholder termination flag
+        info = {}     # Placeholder additional information
 
         self.state = [map_to_closest(num) for num in self.state]
-            
+
+        print("ROS State:", self.state)
+        distance_to_pad = np.linalg.norm(self.state - self.landing_pad_position)
+
         # Check if the drone is within the finite 3D space around the landing pad
         position = self.state[:3]
-
         if all(abs(p) < GRID_RESOL for p in position):
             self.landed = True
             done = True
@@ -240,34 +302,37 @@ class CustomEnv(gym.Env):
 
         rclpy.spin_once(self.check_armed)
 
-        #reset if crashed or after 3000 episodes
-        if self.check_armed.crashed or self.eps > 3000:
-            self.crashed = True
+        if self.mode == 'simulation':    
+            #reset if crashed or after 3000 episodes
+            if self.check_armed.crashed or self.eps > 3000:
+                self.crashed = True
 
-            gazebo_res_command = ["gz","service", "-s", "/world/iris_runway/control", "--reqtype", 
-                                  "gz.msgs.WorldControl", "--reptype", "gz.msgs.Boolean",
-                                  "--timeout", "3000", "--req", "reset: {all: true}"]
-            subprocess.Popen(gazebo_res_command)
+                gazebo_res_command = ["gz","service", "-s", "/world/iris_runway/control", "--reqtype", 
+                                    "gz.msgs.WorldControl", "--reptype", "gz.msgs.Boolean",
+                                    "--timeout", "3000", "--req", "reset: {all: true}"]
+                subprocess.Popen(gazebo_res_command)
 
-            os.kill(self.ardupilot_process.pid, 2)
-            os.kill(self.gazebo_process.pid, 2)
-            #os.kill(self.mavros_process.pid, 2)
+                os.kill(self.ardupilot_process.pid, 2)
+                os.kill(self.gazebo_process.pid, 2)
+                #os.kill(self.mavros_process.pid, 2)
 
-            time.sleep(3)
+                time.sleep(3)
 
-            self.launch_gazebo()
-            self.launch_ardupilot()
-            #self.launch_ros2_mavros()
+                self.launch_gazebo()
+                self.launch_ardupilot()
+                #self.launch_ros2_mavros()
+                
+                time.sleep(20)
+
+                self.prepare_flight()
+                self.eps = 0
+
+            if self.step_counter > (6+6+8)/GRID_RESOL+10 or distance_to_pad > self.landing_pad_radius:
+                self.crashed = True
+                done = True
             
-            time.sleep(20)
+            self.step_counter += 1 
 
-            self.prepare_flight()
-            self.eps = 0
-
-        if self.step_counter > (6+6+8)/GRID_RESOL+10 or distance_to_pad > self.landing_pad_radius:
-            self.crashed = True
-            done = True
-        
         if self.previous_outside is not None:
             if np.sqrt(self.state[0]*self.state[0] + self.state[1]*self.state[1]) < GRID_RESOL:
                 if self.inside :
@@ -298,9 +363,6 @@ class CustomEnv(gym.Env):
             reward = -200 * distance_to_pad #/ GRID_RESOL
             done = True
             print("Crashed")
-
-        self.step_counter += 1
-
         
         print("Reward:", reward)
         
@@ -312,17 +374,23 @@ class CustomEnv(gym.Env):
         Cleans up resources by killing the external processes and shutting down the ROS2 node.
         Writes state-action counter to file
         """
-        # Write state-action counter to file
-        with open("dict_S_a.txt", 'a') as file:
-            for key_x in counter_dict:
-                for key_y in counter_dict[key_x]:
-                    for key_z in counter_dict[key_x][key_y]:
-                        for key_a, count in counter_dict[key_x][key_y][key_z].items():
-                            file.write(f"({key_x}, {key_y}, {key_z}, {key_a}) -> {count}\n")
 
-        # Shutdown ROS2 and external processes
+        if self.mode == 'simulation':
+            # Write state-action counter to file
+            with open("dict_S_a.txt", 'a') as file:
+                for key_x in counter_dict:
+                    for key_y in counter_dict[key_x]:
+                        for key_z in counter_dict[key_x][key_y]:
+                            for key_a, count in counter_dict[key_x][key_y][key_z].items():
+                                file.write(f"({key_x}, {key_y}, {key_z}, {key_a}) -> {count}\n")
+
+            # Shutdown ROS2 and external processes
+            os.kill(self.ardupilot_process.pid, 2)
+            os.kill(self.gazebo_process.pid, 2)
+            #os.kill(self.mavros_process, 2)
+        
+        # Clean up ROS 2 resources
         self.node.destroy_node()
-        os.kill(self.ardupilot_process.pid, 2)
-        os.kill(self.gazebo_process.pid, 2)
-        #os.kill(self.mavros_process, 2)
         rclpy.shutdown()
+
+
