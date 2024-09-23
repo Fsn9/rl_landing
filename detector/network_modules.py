@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from squeeze_exciter import SE
-from cbam import CBAM
+from detector.squeeze_exciter import SE
+from detector.cbam import CBAM
 HEAD_TYPE = 'i'
 
 class ConvStem(nn.Module):
@@ -249,7 +249,7 @@ class VisionTransformer(nn.Module):
         self.pos_embedding = nn.Parameter(torch.randn(1, self.n_tokens + self.actual_num_patches, embed_dim*self.num_modalities))
 
     # Forward do ViT
-    def forward(self, x):
+    def forward(self, x, Lander_Class=False): #to active/deactive final MLPs blocks
         """ [Stage 1] """
         """Split channels"""
         modalities = {}
@@ -326,6 +326,10 @@ class VisionTransformer(nn.Module):
             x = x + inp
 
         x = x.transpose(0, 1) if HEAD_TYPE != 'd' and HEAD_TYPE != 'g' and HEAD_TYPE != 'h' else x
+        #return x for Detector+DQN
+        if Lander_Class:
+          return x
+
         """ [Stage 6] """
         """ Perform prediction (depends on head type) """
         x_conf_head = []
