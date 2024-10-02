@@ -14,6 +14,12 @@ class OneLayerMLP(nn.Module):
             nn.Linear(32, out_dim),
         )
 
+        self.__num_params = sum(p.numel() for p in self.parameters())
+    
+    @property
+    def num_params(self):
+        return self.__num_params
+
     def forward(self, x):
         logits = self.layers(x)
         return logits
@@ -33,6 +39,12 @@ class TwoLayerMLP(nn.Module):
             nn.ReLU(),
             nn.Linear(64, out_dim),
         )
+
+        self.__num_params = sum(p.numel() for p in self.parameters()) # This should be inherited from a NN parent class
+    
+    @property
+    def num_params(self):
+        return self.__num_params
 
     def forward(self, x):
         logits = self.layers(x)

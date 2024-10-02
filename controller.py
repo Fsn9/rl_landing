@@ -5,6 +5,7 @@ from std_msgs.msg import String
 
 from geometry_msgs.msg import TwistStamped, PoseStamped, Pose
 from geographic_msgs.msg import GeoPointStamped
+from sensor_msgs.msg import Image
 
 from gz.msgs10.pose_pb2 import Pose as PosePB2
 from gz.msgs10.boolean_pb2 import Boolean as BooleanPB2
@@ -12,9 +13,15 @@ import gz.transport13 as transport13
 
 from rl_landing.networks import OneLayerMLP
 
+from rl_landing.detector.network_modules import VisionTransformer
+
 from rl_landing.replay_memory import ReplayMemory
 
+from torchvision.transforms import ToTensor, Grayscale, Resize, ToPILImage
+
 import torch
+
+import cv2
 
 import torch.optim as optim
 from torch.linalg import norm
@@ -36,9 +43,19 @@ import os
 
 from rl_landing.agent import *
 from rl_landing.illegal_actions import IllegalActions
-
+import json
 current_GMT = time.gmtime()
 timestamp = str(calendar.timegm(current_GMT))
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+#resize = Resize(size = ACTUAL_SIZE_TUPLE, antialias=True)
+to_grayscale = Grayscale()
+to_tensor = ToTensor()
+observation = torch.zeros((1, 160, 160)).to(DEVICE)
+count_frames = 0
+
+POSSIBLE_ARTUGA_COORDINATES = [2,6,-2,-6]
 
 """
 class ROS2Controller that has:
@@ -51,12 +68,16 @@ class ROS2Controller(Node):
 
     def __init__(self, name='ros2 controller'):
         super().__init__(name)
+        
+        self.name = name
+        
         self.publisher_ = self.create_publisher(TwistStamped, '/ap/cmd_vel', 10)
 
         qos_policy = rclpy.qos.QoSProfile(reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT,
                                           history=rclpy.qos.HistoryPolicy.KEEP_LAST,
                                           depth=1)
     
+        """ Subs"""
         self.pose_sub = self.create_subscription(PoseStamped,'/ap/pose/filtered',self.pose_cb,qos_policy)
         self.pose_sub  # prevent unused variable warning
         self.cur_position = None
@@ -65,15 +86,36 @@ class ROS2Controller(Node):
         self.gps_sub  # prevent unused variable warning
         self.cur_gps = None
 
+        self.vis_img_sub = self.create_subscription(Image,'/visual_camera/image',self.vis_img_cb,qos_policy)
+        self.vis_img_sub  # prevent unused variable warning
+        self.cur_vis_img = None
+        self.count_vis_frames = 0
+
+        """ Publishers """
+        self.detection_pub = self.create_publisher(Image, 'detection/image', qos_policy)
+
         self.i = 0
         
+        """ ROS2 api node """
         self.node_set_gz_pose = transport13.Node()
-        
+
+        """ Landing target object """
+        self.maximum_distance_landing_target = 8 # TODO remove this
+        self.reset_marker()
+
+        print(f'Initialized ROS2 Controller {self.name}')
+
+        self.spin() # Roll callbacks enabling systems to get first data
+    
+    def update_marker_position(self):
+        self.landing_target_position = [random.choice(POSSIBLE_ARTUGA_COORDINATES),random.choice(POSSIBLE_ARTUGA_COORDINATES), 0.0]
+        self.landing_target_position[2] = 0.0
+
     """ Gazebo set model service"""
     def set_gz_model_pose(self, name, pose):
         # Service request message
         req = PosePB2()
-        req.name = "artuga_0"
+        req.name = name
         req.position.x = pose[0]
         req.position.y = pose[1]
         req.position.z = pose[2]
@@ -92,6 +134,10 @@ class ROS2Controller(Node):
         else:
             print("Service call failed.")
     
+    def reset_marker(self):
+        self.update_marker_position()
+        self.set_gz_model_pose('artuga_0',self.landing_target_position)
+
     def spin(self):
         rclpy.spin_once(self)
 
@@ -102,6 +148,13 @@ class ROS2Controller(Node):
     def gps_cb(self, msg):
         self.cur_gps = np.array([msg.position.latitude,msg.position.longitude,msg.position.altitude])
         # self.get_logger().info('I heard gps altitude: "%s"' % msg.position)
+    
+    def vis_img_cb(self, msg):
+        global count_frames, observation, resize
+        
+        self.count_vis_frames += 1
+
+        self.cur_vis_data = msg.data # Save msg
 
     # def action_pub(self):
     #     msg = TwistStamped()
@@ -129,41 +182,53 @@ class ROS2Controller(Node):
 
         self.get_logger().info('Publishing: "%s"' % msg.twist)
 
-class RL(ROS2Controller):
-    def __init__(self, name):
-        super().__init__('dqn')
+class RL:
+    def __init__(self, params):
+        self.name = params.get('name')
 
         global timestamp
         
         self.cumulative_reward = 0
         
         """ Initialize wandb log platform """
-        wandb.login()
-        self.run = wandb.init(
-            project="rl_landing",
-            config=self.config,
-        )
+        # if to_train:
+        #     wandb.login()
+        #     self.run = wandb.init(
+        #         project="rl_landing",
+        #         config=self.config,
+        #     )
 
         """ Initialize revelant paths """
-        self._wd_path = os.getcwd() # working directory
-        self._pkg_path = os.path.join('src','rl_landing','rl_landing')
+        self._pkg_path = params.get('pkg_path')
+        self._model_path = params.get('model_path')
+        self._run_path = params.get('run_path')
 
-        """ Initializes results dir if not existent """
-        self._results_path = os.path.join(self._pkg_path,'results')
-        if not os.path.exists(self._results_path):
-            os.mkdir(self._results_path)
-        
-        """ Initializes current results dir """
-        self._log_path = os.path.join(self._results_path, "results" + "_" + timestamp)
-        os.mkdir(self._log_path)
+        """ Initializes runs dir if not existent """
+        self._runs_path = os.path.join(self._pkg_path,'runs')
+        if not os.path.exists(self._runs_path):
+            os.mkdir(self._runs_path)
 
-        """ Initializes model paths """
-        self._last_model_path = os.path.join(self._log_path, "last.pth")
-        self._best_model_path = os.path.join(self._log_path, "best.pth")
-        self._last_target_model_path = os.path.join(self._log_path, "last_target.pth")
-        self._best_target_model_path = os.path.join(self._log_path, "best_target.pth")
+        """ If training, create new run dir """
+        if not (params.get('to_test') or params.get('to_resume')):        
+            """ Initializes current results dir """
+            self._run_path = os.path.join(self._runs_path, "run" + "_" + timestamp)
+            os.mkdir(self._run_path)
 
-    
+            """ Initializes model paths """
+            self._last_model_path = os.path.join(self._run_path, "last.pth")
+            self._best_model_path = os.path.join(self._run_path, "best.pth")
+            self._last_target_model_path = os.path.join(self._run_path, "last_target.pth")
+            self._best_target_model_path = os.path.join(self._run_path, "best_target.pth")
+        else: # test or resume
+            """ Initializes current results dir """
+            self._run_path = os.path.join(self._runs_path, "run" + "_" + timestamp) # TODO get run id from <model_path>
+
+            """ Initializes model paths """
+            self._last_model_path = os.path.join(self._run_path, "last.pth")
+            self._best_model_path = os.path.join(self._run_path, "best.pth")
+            self._last_target_model_path = os.path.join(self._run_path, "last_target.pth")
+            self._best_target_model_path = os.path.join(self._run_path, "best_target.pth")
+
     def finish(self):
         print('Finishing RL process')
         self.run.finish() # closes wandb
@@ -191,18 +256,263 @@ class RL(ROS2Controller):
     def reset(self):
         pass
 
+    def decide(self, state):
+        raise NotImplementedError
+
+class Lander(ROS2Controller):
+    """
+    Lander module incorporating:
+    a) A transformer-based detector
+    b) A RL policy that learns a landing task
+    """
+    def __init__(self, params):
+        super().__init__(params.get('name'))
+
+        self.spin() # make first spin callbacks to get data from topics
+
+        self.freeze = params.get('freeze')
+
+        """ Load config file with model parameters """
+        self._config_file = params.get('config_file')
+        self._cfg_path = os.path.join(params.get('pkg_path'), 'config', self._config_file)
+        self._cfg = {}
+        if not os.path.exists(self._cfg_path):
+            os.mkdir(self._cfg_path)
+        if self._config_file:
+            with open(self._cfg_path,'r') as cfg_json:
+                self._cfg = json.load(cfg_json)
+
+        params['config'] = self._cfg # Add config object to params dictionary to be passed to models
+        
+        params['world_ptr'] = self # Pointer to ros2 and gazebo API such that models can get updated observations
+
+        self.detector = VisionTransformer(params)
+        params['input_size'] = self.detector.flatten_size # TODO change this to @property
+
+        self.agent = DQN(params)
+
+        print('Global parameters: ', params)
+
+        self.params = params # Save params
+    
+    def __call__(self):
+        print('Lander.__call__')
+
+        """ 1. Detector """
+        # 1) chamar o Detetor.observe para processar as mensagens do ROS
+        # 1.1) passar esse processamento pelo detetor
+        obs = Detector.observe(self.cur_vis_data)
+        embeddings = self.detector(obs, Lander_Class=True)
+        print('Embeddings', embeddings.shape)
+        pos = self.cur_position # save current position of agent in the world (global knowledge) for the reward function
+
+        """ 2. Agent """
+        # 2) com os embeddings do detetor passá-lo pelo agente e recolher as açoes
+        action = self.agent.decide(state=embeddings)
+        print('Action', action)
+
+        # 3) Atuar no world com essas açoes
+        self.act(*self.agent.action_space[action.item()])
+
+        # 4) esperar um pouco até norma entre estados is bigger than n=0.25 or duration above 5secs
+        """ Get state until state changes """
+        state_start_time = time.time()
+        while True:
+            """ 3. Spin again to get next position from callbacks """
+            self.spin() # TODO this should wait for change of state
+
+            """ 4. Get next state """
+            # 5) fazer 1) e 1.1) outra vez
+            obs = Detector.observe(self.cur_vis_data)
+            next_embeddings = self.detector(obs, Lander_Class=True)
+            next_pos = self.cur_position # save current position of agent in the world (global knowledge) for the reward function
+
+            distance_between_states = norm(embeddings - next_embeddings) # TODO i could do diff between embs or images
+            print('norm between states: ', distance_between_states)
+            
+            """ If distance covered is bigger than 0.25 or transition duration above 5 seconds """
+            if distance_between_states >= 0.25 or (time.time() - state_start_time) >= 5:
+                break
+        # 6) fazer o train() com a informacao toda.
+        self.agent.train(state=embeddings,action=action,next_state=next_embeddings,cur_position=pos,next_position=next_pos)
+        exit()
+
+        # PERGUNTA FULCRAL: faço isto tudo internamento ao DQN como está (e feio), ou tudo controlado pelo lander?
+        # melhor se for o lander a fazer este loop.
+        # a) o DQN passa a ter entao o actions = decide(x) e nao um act()
+        # b) o Lander atua no world
+        # c) e o detetor antes de a) e depois de b) processa a mensagem que é atualizada no spin()
+        ## DEVE SER PORTANTO O LANDER A GERIR ESTE PIPELINE todo!
+
+    # def connect_networks(self, x): # TODO change to learn
+    #     # self.x = self.detector.forward(x, Lander_Class=True)
+    #     # res = self.agent.train(self.x.flatten())
+    #     # print(res)
+    #     pass
+
+    def act(self, *action):
+        print('action: ', *action)
+        super().__call__(*action) # Performs the actions in the inherited environment
+
+    def forward(self, x):
+        x = self.detector(x, Lander_Class=True)
+        print('Embeddings', x.shape)
+        action = self.agent(x)
+        print('Action', action)
+
+class Detector(ROS2Controller):
+    def __init__(self, params):
+        """ Args disambiguation """
+        self.params = params
+        self.name = self.params['name']
+        super().__init__(self.name)
+
+        # self.to_train = train
+        # self.to_test = test
+        # self.to_resume = resume
+        # self.model_path = model
+
+        self.spin() # spin callbacks to get data from topics
+        self.observe()
+
+        self.detector = VisionTransformer(params).to(DEVICE)
+        
+        if self.params['model']:
+            self.load_weights(self.params['model'])
+
+        print('Initialized detector')
+
+    def load_weights(self, path): # Put in RL class with extra argument to_train: bool. depending on that is model.eval() or model.train()
+        model_state_dict = self.detector.state_dict()
+
+        """ Load model """
+        new_model = torch.load(path)
+
+        for key1, key2 in zip(new_model['state_dict'], self.detector.state_dict()): 
+            model_state_dict[key2] = new_model['state_dict'][key1] # Assign parameters from new model to old model (contouring the Unexpected Key error)
+
+        self.detector.load_state_dict(model_state_dict) # load new assigned state_dict
+        self.detector.eval()
+        self.detector.to(device)
+
+    def observe(self):
+        self.spin()
+        np_arr = np.frombuffer(self.cur_vis_data, np.uint8) # convert sensor_msgs/Image to numpy
+        # TODO put in [0,1] float
+        np_arr = np.reshape(np_arr, (160, 160, 3)) # Reshape it as RGB 160x160 and batch size = 1
+        tensor = to_tensor(np.array(np_arr)).to(DEVICE) # Convert to torch.tensor
+        tensor = to_grayscale(tensor) # Convert from RGB to grayscale
+        img = ToPILImage()(tensor) # TODO remove after debug
+        img.save('/home/francisco/Downloads/pil.png')
+        # tensor = torch.permute(tensor, (2,0,1)) # change from (H,W,C) to (C,H,W)
+        self.cur_vis_img = tensor
+    
+    @staticmethod
+    def observe(cur_vis_data):
+        np_arr = np.frombuffer(cur_vis_data, np.uint8) # convert sensor_msgs/Image to numpy
+        # TODO put in [0,1] float
+        np_arr = np.reshape(np_arr, (160, 160, 3)) # Reshape it as RGB 160x160 and batch size = 1
+        tensor = to_tensor(np.array(np_arr)).to(DEVICE) # Convert to torch.tensor
+        tensor = to_grayscale(tensor) # Convert from RGB to grayscale
+
+        tensor = torch.cat((observation,observation,tensor), dim=0) # TODO this fakes R and G channel and makes a transforms a (1,H,W) tensor into a (3,H,W)
+
+        img = ToPILImage()(tensor) # TODO remove after debug
+        img.save('/home/francisco/Downloads/pil.png')
+
+        tensor = tensor.unsqueeze(0) # This adds the batch dimension
+        # tensor = torch.permute(tensor, (2,0,1)) # change from (H,W,C) to (C,H,W)
+        return tensor
+
+    def __call__(self):
+        self.observe()
+        """ Feed detector with tensor of (1,3,H,W) """
+        # from torchvision.io import read_image
+        # img_tensor = read_image('/home/francisco/ros2_ws/src/rl_landing/rl_landing/detector/test/im-concat-visual-fail-304_27-07-2023_17-37-09_bag-landing_fadeup_20_07_2023_visual-fail-_png.rf.d8a95bfb7ae3803f7f4fcab66badd877.jpg.png') # read image and convert to tensor
+        # img_tensor = img_tensor.float()/255 # normalize TODO será que é preciso?
+        # img_tensor = img_tensor.unsqueeze(0) # add batch dimension
+        # img_tensor = img_tensor.to(device) # send to cuda if available
+        # print(img_tensor.shape)
+        # obs = img_tensor
+
+        obs = torch.cat((observation,observation,self.cur_vis_img), dim=0) # TODO this fakes R and G channel
+        
+        """ Fake LiDAR """
+        FAKE_LIDAR = True
+        if FAKE_LIDAR:
+            p_at_l = {'h': (90,110), 'w': (40,60)}# square length artuga
+            for i in range(p_at_l['h'][0],p_at_l['h'][1]):
+                for j in range(p_at_l['w'][0],p_at_l['w'][1]):
+                    if p_at_l['h'][0] + 2 < i < p_at_l['h'][1] - 2 and p_at_l['w'][0] + 2 < j < p_at_l['w'][1] - 2:
+                        continue 
+                    obs[0,i,j] = 1
+        """ Fake thermal """
+        FAKE_THERMAL = True
+        if FAKE_THERMAL:
+            p_at_t = {'h': (94,114), 'w': (44,64)}# square length artuga
+            for i in range(p_at_t['h'][0],p_at_t['h'][1]):
+                for j in range(p_at_t['w'][0],p_at_t['w'][1]):
+                    if p_at_t['h'][0] + 2 < i < p_at_t['h'][1] - 2 and p_at_t['w'][0] + 2 < j < p_at_t['w'][1] - 2:
+                        continue 
+                    obs[1,i,j] = 1
+        obs = obs.unsqueeze(0) # This adds the batch dimension
+        bbox, _, obj = self.detector.forward(obs)
+        print('bbox:',bbox)
+        print('obj:',torch.sigmoid(obj))
+        self.publish(obs.squeeze(0), bbox, obj)
+        return (bbox,obj)
+    
+    def publish(self, image, bbox, objectness):
+        # image should be in HWC
+        RESIZE = 2 # TODO these two lines should be in config
+        IMAGE_SIZE = tuple(np.array([160,160],dtype=np.uint16) * RESIZE)
+        FONT_SCALE = 0.2 * RESIZE
+
+        """ Prepare formats """
+        bbox = (bbox.cpu().detach().numpy().squeeze() * image.shape[-1] * RESIZE).astype(np.uint8) # to numpy and shape (4,) and unnormalized
+        image = (torch.permute(image,(1,2,0)).cpu().detach().numpy() * 255).astype(np.uint8) # to numpy and shape (H,W,C)
+        image = np.ascontiguousarray(image)
+
+        """ Resize for better visualization """
+        image = cv2.resize(image, (IMAGE_SIZE[0],IMAGE_SIZE[1]))
+
+        """ Draw bbox and objectness """
+        if bbox[0] < bbox[2] and bbox[1] < bbox[3]:
+            image = cv2.rectangle(image, (bbox[0],bbox[1]), (bbox[2], bbox[3]), (255, 0, 0), 2)
+            image = cv2.putText(image, 'obj: ' + str(round(torch.sigmoid(objectness).item(),2)), (20,20), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 0, 0), 1, cv2.LINE_AA)
+        else:
+            image = cv2.putText(image, 'no prediction and obj: ' + str(round(torch.sigmoid(objectness).item(),2)), (20,20), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 0, 0), 1, cv2.LINE_AA)
+        
+        """ Prepare message """
+        output_image_msg = Image()
+        output_image_msg.height = image.shape[0]  # Image height (rows)
+        output_image_msg.width = image.shape[1]   # Image width (columns)
+        output_image_msg.encoding = 'rgb8'  # or 'bgr8', 'mono8' depending on your tensor data
+        output_image_msg.is_bigendian = False
+        output_image_msg.step = image.shape[1] * 3  # Full row length in bytes (width * channels)
+        
+        """ Convert the NumPy array into a flattened list for ROS message """
+        output_image_msg.data = image.tobytes()
+
+        """ Publish """
+        self.detection_pub.publish(output_image_msg)
+
 """
 DQN method
 """
 class DQN(RL):
-    def __init__(self, controller_name, train, test, resume, model): # *args comes with (controller_name: str, train: bool, test: bool, resume: bool, model: str)
+    def __init__(self, params):
         """ Args disambiguation """
-        print('Args given: ', controller_name, train, test, resume, model)
-        self.name = controller_name
-        self.to_train = train
-        self.to_test = test
-        self.to_resume = resume
-        self.model_path = model
+        self.params = params
+
+        self.name = params.get('name')
+        self.to_train = params.get('to_train')
+        self.to_test = params.get('to_test')
+        self.to_resume = params.get('to_resume')
+        self.model_path = params.get('model_path')
+        self.pkg_path = params.get('pkg_path')
+        self.world_ptr = params.get('world_ptr')
+
         self.best_target_model_path = self.model_path.replace("best", "best_target")
         self.last_target_model_path = self.model_path.replace("best", "last_target")
 
@@ -225,12 +535,12 @@ class DQN(RL):
             'final_episode_epsilon_decay': self.final_episode_epsilon_decay,
         } # This will be the config in wandb init
 
-        super().__init__(self.name)
+        super().__init__(params)
 
         self.action_space = simple_actions
         self.action_space_len = len(simple_actions)
 
-        self.input_size = 3
+        self.input_size = params.get('input_size')
         self.output_size = self.action_space_len
 
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -239,6 +549,7 @@ class DQN(RL):
         self.main_net = OneLayerMLP(self.input_size,self.output_size).to(self.device)
         self.target_net = OneLayerMLP(self.input_size,self.output_size).to(self.device)
         self.target_net.load_state_dict(self.main_net.state_dict()) # Copy behaviour policy's weights to target net
+        self.target_net.eval()
 
         self.tau = 0.001
         self.optimizer = optim.AdamW(self.main_net.parameters(), lr=self.alpha, amsgrad=True)
@@ -263,26 +574,6 @@ class DQN(RL):
             self.optimizer.load_state_dict(self.loaded_model['optimizer_state_dict'])
             print(f'Loaded optimizer model ({self.optimizer})')
 
-            exit()
-
-            #self.loaded_optimizer = torch.load(self.model_path, weights_only=True)
-
-        # if self.to_test:
-        #     self.main_net.load_state_dict(self.loaded_model['model_state_dict'])
-        #     print(f'Loaded main model ({self.model_path}) to test')
-        # if self.to_resume:
-        #     self.main_net.load_state_dict(self.loaded_model['model_state_dict'])
-        #     print(f'Loaded main model ({self.model_path}) to resume')
-        #     self.target_net.load_state_dict(self.loaded_target_model['model_state_dict'])
-        #     print(f'Loaded target model ({self.target_model_path}) to resume')
-        #     self.optimizer.load_state_dict(self.loaded_model['optimizer_state_dict'])
-        #     print(f'Loaded optimizer model ({self.optimizer}) to resume')
-
-        # TODO: this should be detached from DQN class
-        self.maximum_distance_landing_target = 8
-        self.landing_target_position = np.random.randint(0,self.maximum_distance_landing_target,size=3).astype(float).tolist()
-        self.landing_target_position[2] = 0.0
-
         """ Metrics """
         self.counter_steps = 0
         self.counter_episodic_steps = 0
@@ -300,12 +591,11 @@ class DQN(RL):
         self.max_reward = -1000
 
         global timestamp
-        with open(os.path.join(self._log_path, 'metrics_' + timestamp + '.csv'), 'w', newline='') as metrics_file:
+        with open(os.path.join(self._run_path, 'metrics_' + timestamp + '.csv'), 'w', newline='') as metrics_file:
             writer = csv.writer(metrics_file)
             writer.writerow(['Avg reward','Num landings','Num crashes'])
 
-        self.spin() # spin callbacks to get data from topics
-        self.state = self.make_state()
+        self.state = self.observe()
         print('Initial state:', self.state)
 
         self.reset()
@@ -319,30 +609,25 @@ class DQN(RL):
     """ On end episode decay epsilon and resets landing target position """
     def reset(self):
         self.decay_epsilon()
-        self.landing_target_position = np.random.randint(-self.maximum_distance_landing_target//2, self.maximum_distance_landing_target//2, size=3).astype(float).tolist()
-        self.landing_target_position[2] = 0.0
+        self.world_ptr.reset_marker()
         print(f'Reseting episode and new epsilon of {self.epsilon}')
     
     """
     returns a torch.tensor of the difference between the current pose and the landing target position
     """
-    def make_state(self):
-        return torch.tensor(self.cur_position - self.landing_target_position).float().to(self.device)
-    
-    def e_greedy(self, state):
-        if random.random() > self.epsilon: # exploit
-            print('Exploiting')
-            with torch.no_grad(): # disables gradient computation (requires_grad=False)
-                return torch.argmax(self.main_net(state).detach().cpu().unsqueeze(0), axis = 1) # get argmax. action is in shape [1]
+    def observe(self):
+        if self.world_ptr.cur_position is None: # To contour bug of position callbacks not being rolled
+            self.world_ptr.cur_position = np.zeros((3,))
+        return torch.tensor(self.world_ptr.cur_position - self.world_ptr.landing_target_position).float().to(self.device)
 
-        else: # explore
-            print('Exploring')
-            return torch.randint(0, self.action_space_len, (1,))
-    
-    def compute_reward(self, state, action, next_state, termination):
+    def compute_reward(self, state, action, next_state, termination, cur_position, next_position):
         _, reason = termination[0], termination[1]
-        dx, dy, dz = abs(next_state[0]) - abs(state[0]), abs(next_state[1]) - abs(state[1]), abs(next_state[2]) - abs(state[2])
+
+        dx, dy, dz = abs(next_position[0]) - abs(cur_position[0]), abs(next_position[1]) - abs(cur_position[1]), abs(next_position[2]) - abs(cur_position[2])
         
+        print(cur_position, next_position)
+        print(dx,dy,dz)
+
         if reason == "landed":
             self.num_landings += 1
             return torch.tensor(2).to(self.device)
@@ -362,7 +647,7 @@ class DQN(RL):
         global timestamp
         """ CSV log """
         avg_reward = (self.cumulative_reward / self.counter_steps).item()
-        with open(os.path.join(self._log_path, 'metrics_' + timestamp + '.csv'), 'a', newline='') as metrics_file:
+        with open(os.path.join(self._run_path, 'metrics_' + timestamp + '.csv'), 'a', newline='') as metrics_file:
             writer = csv.writer(metrics_file)
             writer.writerow([avg_reward,self.num_landings,self.num_crashes])
         """ Wandb log """
@@ -371,7 +656,7 @@ class DQN(RL):
 
     """ Returns if terminated flag and the reason """
     def terminated(self, state, action, next_state):
-        x_pos, y_pos, z_pos = self.cur_position[0], self.cur_position[1], self.cur_position[2] # get already updated next positions
+        x_pos, y_pos, z_pos = self.world_ptr.cur_position[0], self.world_ptr.cur_position[1], self.world_ptr.cur_position[2] # get already updated next positions
 
         # if max steps
         if self.counter_episodic_steps > self.MAX_STEPS:
@@ -416,6 +701,8 @@ class DQN(RL):
         #termination_batch[0] = True # TODO remove
         non_terminated_idxs = (termination_batch == False).nonzero().squeeze() # squeeze because it delivers (B,1). I want (B,)
 
+        self.main_net.train()
+
         """ Get Qs """
         # The idea is feeding the *state* from the batch and then select the Q according to the *action* taken
         predicted_qs = self.main_net(state_batch)
@@ -448,41 +735,59 @@ class DQN(RL):
             target_net_state_dict[key] = main_net_state_dict[key] * self.tau + (1 - self.tau) * target_net_state_dict[key]
         self.target_net.load_state_dict(target_net_state_dict) # copy soft updated weights
 
-    def test(self):
-        raise NotImplementedError
+    def decide(self, state):
+        return self.e_greedy(state, train=True)
 
-    def train(self):
+    def greedy(self, state, train=False):
+        self.main_net.eval()
+        with torch.no_grad(): # disables gradient computation (requires_grad=False)
+            y = torch.argmax(self.main_net(state).detach().cpu().unsqueeze(0), axis = 1) # get argmax. action is in shape [1]
+        if train: 
+            self.main_net.train()
+        return y
+
+    def e_greedy(self, state, train=False):
+        self.main_net.eval() # This deactivates batchnorm and dropout layers
+        if random.random() > self.epsilon: # exploit
+            print('Exploiting')
+            with torch.no_grad(): # disables gradient computation (requires_grad=False)
+                y = torch.argmax(self.main_net(state).detach().cpu().unsqueeze(0), axis = 1) # get argmax. action is in shape [1]
+            if train: 
+                self.main_net.train()
+            return y
+
+        else: # explore
+            print('Exploring')
+            return torch.randint(0, self.action_space_len, (1,))
+
+    # def forward(self, x, train=False):
+    #     self.main_net.eval()
+    #     with torch.no_grad(): # disables gradient computation (requires_grad=False)
+    #         y = torch.argmax(self.main_net(x).detach().cpu().unsqueeze(0), axis = 1) # get argmax. action is in shape [1]
+    #     if train: 
+    #         self.main_net.train()
+    #     return y
+
+    def test(self):
+        # TODO metrics of test
+        """ 2. Act"""
+        # action = self.greedy(state)
+        super().__call__(*self.action_space[action.item()]) # send actions to ROS simulator
+        return
+
+    def train(self, state, action, next_state, cur_position, next_position):
         """ Update some metric variables """
         self.counter_steps += 1
         self.counter_episodic_steps += 1
-
-        """ 1. Observe """
-        state = self.make_state()
-
-        """ 2. Act """
-        action = self.e_greedy(state)
-        super().__call__(*self.action_space[action.item()]) # send actions to ROS simulator
-
-        """ Get state until state changes """
-        state_start_time = time.time() 
-        # print('Before spin: ', state, 'action: ', action)
-        while True:
-            """ 3. Spin again to get next position from callbacks """
-            self.spin() # TODO this should wait for change of state
-
-            """ 4. Get next state """
-            next_state = self.make_state()
-            distance_between_states = norm(state - next_state)
-            
-            """ If distance covered is bigger than 0.1 or transition duration above 5 seconds """
-            if distance_between_states >= 0.25 or (time.time() - state_start_time) >= 5:
-                break
 
         """ Check termination """
         termination = self.terminated(state, action, next_state)
 
         """ 5. Get reward """
-        reward = self.compute_reward(state, action, next_state, termination)
+        reward = self.compute_reward(state, action, next_state, termination, cur_position, next_position) # TODO update reward because now i cant make
+        print('reward: ', reward)
+        exit()
+        # R(s,a,s')?!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
         """ 6. Store experience """
         self.store(state, action, reward, next_state, termination)
@@ -537,15 +842,16 @@ class DQN(RL):
         
         if self.num_episodes == self.max_episodes:
             print('Ended Learning')
+            # TODO launch here the test after training
             return (termination[0], termination[1], self.landing_target_position) # returns termination cause and new marker position
         
         return (termination[0], termination[1], self.landing_target_position) # returns termination cause and new marker position # what returns if everything is ok
     
-    def __call__(self):
+    def __call__(self,x):
         if self.to_train:
-            return self.train()
+            return self.train(x)
         else:
-            return self.test()
+            return self.test(x)
 
 """ TODO where to put illegal actions """
 action_opposition_matrix = np.array([[0,1,0,0,0,0,0,1,1],
@@ -825,25 +1131,31 @@ class dqn(agent_base):
 Dummy method
 """
 class Dummy(ROS2Controller):
-    def __init__(self, controller_name, train, test, resume, model):
+    def __init__(self, system_name, train, test, resume, model):
         super().__init__('dummy')
 
 """
 Main that inits and returns controller to mavlink module
 """
-def main(controller_name, train, test, resume, model):
+def main(**kwargs):
     rclpy.init(args=None)
 
-    controller = list_controllers[controller_name](controller_name, train, test, resume, model)
+    input_size = 19200 # TODO this should be given in
 
-    return controller
+    if kwargs['mission'] == "detection":
+        system = Detector(kwargs)
+    else:
+        system = list_controllers[kwargs['name']](kwargs)
+
+    return system
 
 list_controllers = {
    'dummy': Dummy,
-   'dqn': DQN
+   'dqn': DQN,
+   'lander': Lander,
 }
 
-load_controller = main # alias for main
+load_system = main # alias for main
 
 if __name__ == '__main__':
     main()

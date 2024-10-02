@@ -1,0 +1,16 @@
+{
+    "embed_dim": 16,
+    "hidden_dim": 512,
+    "num_heads": 8,
+    "num_layers": 6,
+    "patch_size": 16,
+    "num_channels": 1,
+    "num_patches": 256,
+    "num_classes": 40,
+    "skip_mult": true,
+    "input_size": 160,
+    "lr": 0.0003,
+    "dropout": 0.2,
+    "active_modalities": [0,1,2],
+    "base_channels": 16
+}

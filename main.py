@@ -1,37 +1,57 @@
 from pymavlink import mavutil
 from math import isclose
 import time
-from .controller import load_controller
+from rl_landing.controller import load_system
 
 import argparse
 
 from random import randint
 
-import wandb
+import os
+
+PKG_PATH = os.path.join(os.getcwd(),'src','rl_landing','rl_landing')
 
 """ Parsing arguments """
 parser = argparse.ArgumentParser()
-parser.add_argument('--mission', type=str, required=False, default='land')
+
+parser.add_argument('--mission', type=str, required=False, default='land', choices=['land','autonomous','detection'])
 parser.add_argument('--takeoff_altitude', type=float, required=False, default=6.0)
 parser.add_argument('--control_period', type=float, required=False, default=3.0)
-parser.add_argument('--controller_name', type=str, required=False, choices=['dummy','dqn'], default='dummy')
+parser.add_argument('--detection_period', type=float, required=False, default=0.1)
+parser.add_argument('--system_name', type=str, required=False, choices=['dummy','dqn','lander','vital'], default='dummy')
+
 parser.add_argument('--train', action='store_true', help = "It trains from scratch or trains from given model if --resume is True")
 parser.add_argument('--test', action='store_true', help = "It tests the given model")
-parser.add_argument('--resume', action='store_true', help="It resumes training of provided model in --model")
-parser.add_argument('--model', type=str, required=False, default='', help="This is the path to the model")
+parser.add_argument('--freeze', action='store_true', help = "If activated, the detector is frozen (does not train)")
+parser.add_argument('--resume', action='store_true', help="It resumes training of provided model in --model_path")
+parser.add_argument('--model_path', type=str, required=False, default='', help="This is the path to the model to test (.ckpt or .pt)")
+parser.add_argument('--run_path', type=str, required=False, default='', help="This is the path to the run to resume training")
+parser.add_argument('--config_file', type=str, required=False, default='', help="This is the configuration containing the parameters in a .json file of the attributes of the model to test")
 
 ap = parser.parse_args()
 
-if ap.mission == "control_vel":
+if ap.mission == "autonomous":
+    if ap.train + ap.test + ap.resume > 1:
+        print('You can not activate simultaneous --train, --test and --resume flags. Activate just one.')
+        exit()
     if ap.train: 
-        ap.test = False
-        if ap.resume and not ap.model:
-            print('Not a provided model to resume. Fill the flag --model [PATH_TO_MODEL] with the model to resume training')
+        if not ap.config_file:
+            print('Not a provided model_path to train. Fill the flag --model_path [PATH_TO_MODEL] with the model to train')
             exit()
     elif ap.test:
-        ap.train = False
-        if not ap.model:
-            print('Not a provided model to test. Fill the flag --model [PATH_TO_MODEL] with the model to test')
+        if not ap.model_path:
+            print('Not a provided model_path to test. Fill the flag --model_path [PATH_TO_MODEL] with the model to test')
+            exit()
+        elif not ap.config_file:
+            print('Not a provided config file to test. Fill the flag --config [CONFIG in .json] with the parameters of the model to test')
+            exit()
+    elif ap.resume:
+        if not ap.run_path:
+            print('Not a provided run_path to resume training. Fill the flag --run_path [RUN_OF_TRAIN] with the run to resume')
+            exit()
+        elif not ap.config_file:
+            # TODO to resume we should only be loading saved config
+            print('Not a provided config file to resume. Fill the flag --config [CONFIG in .json] with the parameters of the model to test')
             exit()
 
 THRUSTER_RF = 1
@@ -195,7 +215,6 @@ def takeoff_mission(connection, altitude):
 def land_mission(connection):
     """ Set guided """
     set_mode(connection, 'LAND')
-    #connection.motors_disarmed_wait() # TODO change for some check that landed instead of check of disarmed
     disarm(connection, timeout=15)
 
 def set_thrusters(connection, rf_pwm, lf_pwm, rb_pwm, lb_pwm):
@@ -218,8 +237,13 @@ def set_autopilot(connection, turn_on=True):
         set_servo_function(THRUSTER_LB, DISABLE_FUNCTION, connection)
         print('Turned off autopilot')
 
-# TODO change to RL precise landing mission
-def control_vel_mission(connection, controller_name, control_period = 3.0):
+"""
+Mission that just launches a trained detector and publishes the bounding box location
+"""
+def detection_mission(connection):
+    """ Land first """
+    land_mission(connection)
+
     """ Set guided """
     set_mode(connection, 'GUIDED')
 
@@ -229,15 +253,70 @@ def control_vel_mission(connection, controller_name, control_period = 3.0):
     """ Takeoff """
     takeoff(connection, altitude=3, block=True)
 
-    """ Get controller """
-    controller = load_controller(controller_name, ap.train, ap.test, ap.resume, ap.model) # Start controller
-    controller.set_gz_model_pose("artuga_0", controller.landing_target_position) # Set artuga to new position
+    """ Initialize controller """
+    detector = load_system(
+            name=ap.system_name,
+            mission=ap.mission,
+            to_train=ap.train, 
+            to_test=ap.test, 
+            to_resume=ap.resume, 
+            model_path=ap.model_path, 
+            freeze=ap.freeze,
+            config_file=ap.config_file,
+            pkg_path=PKG_PATH
+    )
+    print(f'Initialized detector {ap.system_name}')
+
+    #detector.set_gz_model_pose("artuga_0", detector.landing_target_position) # Set artuga to new position
+
+    """ Start control cycle """
+    try:
+        while True:
+            """ Call detector, meaning asking the detector to infer marker location """
+            report = detector() # report return has marker detected location
+
+            """ Set pace """
+            time.sleep(ap.detection_period)
+            
+    except KeyboardInterrupt:
+            #controller.finish() TODO remove
+            land_mission(connection)
+            print('Interrupted mission')
+
+def autonomous_mission(connection):
+    # """ Land first """
+    # land_mission(connection)
+
+    # """ Set guided """
+    # set_mode(connection, 'GUIDED')
+
+    # """ Arm """
+    # arm(connection)
+
+    # """ Takeoff """
+    # takeoff(connection, altitude=3, block=True)
+
+    """ Initialize controller """
+    controller = load_system(
+            name=ap.system_name, 
+            to_train=ap.train, 
+            to_test=ap.test, 
+            to_resume=ap.resume, 
+            model_path=ap.model_path,
+            run_path=ap.run_path,
+            mission=ap.mission,
+            config_file=ap.config_file,
+            freeze=ap.freeze,
+            pkg_path=PKG_PATH
+    )
+    print(f'Initialized controller {ap.system_name}')
 
     """ Start control cycle """
     try:
         while True:
             """ Call controller, meaning, rolling an RL interaction """
             report = controller() # report return has e.g., (episode ended: bool, ending cause: landed, new_target_pose: np.array)
+            exit() # TODO here
             if report[0].item(): # if terminated episode from controller, restart UAV to new position
                 print('Ended episode. Resetting UAV and marker')
 
@@ -248,7 +327,7 @@ def control_vel_mission(connection, controller_name, control_period = 3.0):
                 takeoff_mission(connection, altitude=randint(1,7)) # put random height and position
 
             """ Set pace """
-            time.sleep(control_period) # TODO check if state changed instead of periodic control
+            time.sleep(ap.control_period) # TODO check if state changed instead of periodic control
             
     except KeyboardInterrupt:
             controller.finish()
@@ -268,7 +347,10 @@ def main():
     if ap.mission == "land": land_mission(connection)
 
     """ Control mission """
-    if ap.mission == "control_vel": control_vel_mission(connection, controller_name=ap.controller_name, control_period=ap.control_period)
+    if ap.mission == "autonomous": autonomous_mission(connection)
+
+    """ Detection mission """
+    if ap.mission == "detection": detection_mission(connection)
 
 if __name__ == '__main__':
     main()

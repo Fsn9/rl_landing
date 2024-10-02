@@ -1,8 +1,12 @@
 import torch
 import torch.nn as nn
-from detector.squeeze_exciter import SE
-from detector.cbam import CBAM
-HEAD_TYPE = 'i'
+from rl_landing.detector.squeeze_exciter import SE
+from rl_landing.detector.cbam import CBAM
+
+HEAD_TYPE = 'i' # TODO por isto no config tambem
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # TODO put this only in one file
+print('Device: ', DEVICE)
 
 class ConvStem(nn.Module):
   """
@@ -85,7 +89,8 @@ class ConvStem(nn.Module):
     return out
 
 class VisionTransformer(nn.Module):
-    def __init__(self, embed_dim, hidden_dim, num_channels, num_heads, num_layers, num_classes, patch_size, num_patches, skip_mult=True, dropout=0.0, input_size = 160, lr = 1e-3, num_modalities = 3):
+    def __init__(self, params):
+    #def __init__(self, embed_dim, hidden_dim, num_channels, num_heads, num_layers, num_classes, patch_size, num_patches, skip_mult=True, dropout=0.0, input_size = 160, lr = 1e-3, num_modalities = 3, freeze = False):
         """
         Inputs:
             embed_dim - Dimensionality of the input feature vectors to the Transformer
@@ -104,23 +109,37 @@ class VisionTransformer(nn.Module):
 
         global args # get reference to global args varriable
 
-        self.num_modalities = num_modalities
+        self.config = params.get('config')
 
-        """ Fixed parameters for this jetson test """
-        self.active_modalities = [0,1,2] # lidar (0), thermal (1) and visual (3) sensors are active
-        self.base_channels = 16
+        self.world_ptr = params.get('world_ptr')
 
-        self.embed_dim = embed_dim
+        self.hidden_dim = self.config.get('hidden_dim')
+        self.num_channels = self.config.get('num_channels')
+        self.num_channels = self.config.get('num_heads')
+        self.num_layers = self.config.get('num_layers')
+        self.patch_size = self.config.get('patch_size')
+        self.num_patches = self.config.get('num_patches')
+        self.skip_mult = self.config.get('skip_mult')
+        self.dropout = self.config.get('dropout')
+        self.input_size = self.config.get('input_size')
+        self.lr = self.config.get('lr')
+        self.active_modalities = self.config.get('active_modalities') # lidar (0), thermal (1) and visual (2) sensors are active
 
-        self.input_size = input_size
+        self.freeze = params.get('freeze')
 
-        self.num_patches = num_patches
+        self.num_modalities = len(self.active_modalities)
 
-        # Size of each patch
-        self.patch_size = patch_size
+        self.base_channels = self.config.get('base_channels')
+
+        self.embed_dim = self.config.get('embed_dim')
+
+        self.input_size = self.config.get('input_size')
+
+        self.num_patches = self.config.get('num_patches')
         
-        # Skip connection element wise multiplication or cat
-        self.skip_mult = skip_mult
+        self.patch_size = self.config.get('patch_size') # Size of each patch
+        
+        self.skip_mult = self.config.get('skip_mult') # Skip connection element wise multiplication or cat
 
         """Conv stems (backbones)"""
         # Linear Layer for Input x projection
@@ -137,12 +156,6 @@ class VisionTransformer(nn.Module):
           self.input_layer2 = ConvStem(in_channels=1, base_channels=self.base_channels, out_cnn_channel=512, embed_dim=self.embed_dim, img_size=[self.input_size, self.input_size], pretrained=True, flatten=False) # flatten a False. só depois de concatenar
           self.actual_patch_size = self.input_layer2.patch_size
           self.actual_num_patches = self.actual_patch_size[0] * self.actual_patch_size[1]
-        
-        """ Print net info """
-        print('[Network info]')
-        print('patch size: ', self.actual_patch_size)
-        print('num patches: ', self.actual_num_patches)
-        print('embed dim: ', self.embed_dim)
 
         """ Dimensionality reduction """
         self.dim_reduction_factor = 2
@@ -166,14 +179,14 @@ class VisionTransformer(nn.Module):
         #self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=num_layers, norm=nn.LayerNorm(embed_dim))
 
         """ Attention blocks """
-        self.SE = SE(embed_dim*self.num_modalities)
-        self.CBAM = CBAM(embed_dim*self.num_modalities)
+        self.SE = SE(self.embed_dim*self.num_modalities)
+        self.CBAM = CBAM(self.embed_dim*self.num_modalities)
 
         """Regression mlps (heads)"""
         # Flattened encoded sizes depending on head type
         if HEAD_TYPE == "a": # [cls_token] for mlp_conf and [reg_vector] for mlp_bbox
           self.mlp_bbox_input_size = self.actual_num_patches * self.embed_dim * self.num_modalities
-          self.mlp_conf_input_size = embed_dim
+          self.mlp_conf_input_size = self.embed_dim
         elif HEAD_TYPE == "b": # [cls_token, reg_vector] for both
           self.mlp_bbox_input_size = self.actual_num_patches * self.embed_dim * self.num_modalities + self.embed_dim * self.num_modalities
           self.mlp_conf_input_size = self.mlp_bbox_input_size
@@ -181,7 +194,7 @@ class VisionTransformer(nn.Module):
           self.mlp_bbox_input_size = self.actual_num_patches * self.embed_dim * self.num_modalities
           self.mlp_conf_input_size = self.mlp_bbox_input_size
         elif HEAD_TYPE == "d": # [cls_token0] for mlp_conf and [cls_token1] for mlp_bbox
-          self.mlp_bbox_input_size = embed_dim
+          self.mlp_bbox_input_size = self.embed_dim
           self.mlp_conf_input_size = self.mlp_bbox_input_size
         elif HEAD_TYPE == "e":
           #self.mlp_bbox_input_size = embed_dim # TODO: go back to this
@@ -207,7 +220,7 @@ class VisionTransformer(nn.Module):
             nn.LayerNorm(self.mlp_bbox_input_size),
             nn.Linear(self.mlp_bbox_input_size, self.embed_dim * self.num_modalities),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(self.dropout),
             nn.LayerNorm(self.embed_dim * self.num_modalities),
             nn.Linear(self.embed_dim * self.num_modalities, self.box_size),
         )
@@ -218,7 +231,7 @@ class VisionTransformer(nn.Module):
               nn.LayerNorm(self.mlp_objectness_input_size),
               nn.Linear(self.mlp_objectness_input_size, self.embed_dim * self.num_modalities),
               nn.GELU(),
-              nn.Dropout(dropout),
+              nn.Dropout(self.dropout),
               nn.LayerNorm(self.embed_dim * self.num_modalities),
               nn.Linear(self.embed_dim * self.num_modalities, self.objectness_size),
           )
@@ -230,23 +243,41 @@ class VisionTransformer(nn.Module):
               nn.LayerNorm(self.mlp_conf_input_size),
               nn.Linear(self.mlp_conf_input_size, self.embed_dim * self.num_modalities),
               nn.GELU(),
-              nn.Dropout(dropout),
+              nn.Dropout(self.dropout),
               nn.LayerNorm(self.embed_dim * self.num_modalities),
               nn.Linear(self.embed_dim * self.num_modalities, self.confidence_size),
           )
 
-        self.dropout = nn.Dropout(dropout) # Dropout layer used in forward
+        self.dropout = nn.Dropout(self.dropout) # Dropout layer used in forward
 
         ''' Parameters/Embeddings '''
         # Classification token parameter
-        self.cls_token_confidence = nn.Parameter(torch.randn(1,1,embed_dim*self.num_modalities))
-        self.cls_token_bbox = nn.Parameter(torch.randn(1,1,embed_dim*self.num_modalities)) # for the case of head type 'd'
-        self.cls_token_objectness = nn.Parameter(torch.randn(1,1,embed_dim*self.num_modalities)) # for the case of head type 'f'
+        self.cls_token_confidence = nn.Parameter(torch.randn(1,1,self.embed_dim*self.num_modalities))
+        self.cls_token_bbox = nn.Parameter(torch.randn(1,1,self.embed_dim*self.num_modalities)) # for the case of head type 'd'
+        self.cls_token_objectness = nn.Parameter(torch.randn(1,1,self.embed_dim*self.num_modalities)) # for the case of head type 'f'
 
         self.n_tokens = 2 if HEAD_TYPE == 'd' or HEAD_TYPE == 'h' else 1 # Define positional embedding size depending on the number of cls tokens
 
         # Polsitional embedding parameter
-        self.pos_embedding = nn.Parameter(torch.randn(1, self.n_tokens + self.actual_num_patches, embed_dim*self.num_modalities))
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.n_tokens + self.actual_num_patches, self.embed_dim*self.num_modalities))
+
+        # if self.freeze:
+        #   for param in self.SE.parameters():
+        #     param.requires_grad = False
+        #   for param in self.CBAM.parameters():
+        #     param.requires_grad = False
+
+        """ Print net info """
+        print('[Network info]')
+        print('flatten size: ', self.flatten_size)
+        print('patch size: ', self.actual_patch_size)
+        print('num patches: ', self.actual_num_patches)
+        print('embed dim: ', self.embed_dim)
+
+        self.to(DEVICE) # move to cuda if possible
+
+    def __call__(self, x, Lander_Class=False):
+      return self.forward(x, Lander_Class)
 
     # Forward do ViT
     def forward(self, x, Lander_Class=False): #to active/deactive final MLPs blocks
@@ -327,7 +358,7 @@ class VisionTransformer(nn.Module):
 
         x = x.transpose(0, 1) if HEAD_TYPE != 'd' and HEAD_TYPE != 'g' and HEAD_TYPE != 'h' else x
         #return x for Detector+DQN
-        if Lander_Class:
+        if Lander_Class: # TODO change naming
           return x
 
         """ [Stage 6] """

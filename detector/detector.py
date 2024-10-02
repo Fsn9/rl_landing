@@ -16,18 +16,22 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print('Device: ', device)
 
 """ Initialize model """
-model = VisionTransformer(embed_dim=EMBED_DIM,
-                          hidden_dim=512,
-                          num_heads=8,
-                          num_layers=6,
-                          patch_size=16,
-                          num_channels=1,
-                          num_patches=256,
-                          num_classes=40,
-                          skip_mult=True,
-                          dropout=0.2,
-                          input_size=IMAGE_SIZE,
-                          lr=LEARNING_RATE,
+model = VisionTransformer({'cfg_file': {
+    "embed_dim": 16,
+    "hidden_dim": 512,
+    "num_heads": 8,
+    "num_layers": 6,
+    "patch_size": 16,
+    "num_channels": 1,
+    "num_patches": 256,
+    "num_classes": 40,
+    "skip_mult": True,
+    "input_size": 160,
+    "lr": 0.0003,
+    "dropout": 0.2,
+    "active_modalities": [0,1,2],
+    "base_channels": 16
+}}
                           )
 model_state_dict = model.state_dict()
 

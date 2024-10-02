@@ -1,8 +1,8 @@
 #!/usr/bin/python
 
-from detector import network_modules
-from detector import squeeze_exciter
-from controller import DQN
+from rl_landing.detector import network_modules
+from rl_landing.detector import squeeze_exciter
+from rl_landing.controller import DQN, RL, Lander
 import torch
 import os
 from torchvision.io import read_image
@@ -10,53 +10,9 @@ from torchvision import transforms
 from time import time
 import rclpy
 
-""" Hyperparameters """
-UM_MODALITIES = 3
-EMBED_DIM = 16
-LEARNING_RATE = 3e-4
-IMAGE_SIZE = 160
-
-class Lander():
-    """
-    
-    """
-    def __init__(self):
-        
-        self.detector = network_modules.VisionTransformer(embed_dim=EMBED_DIM,
-                                                          hidden_dim=512,
-                                                          num_heads=8,
-                                                          num_layers=6,
-                                                          patch_size=16,
-                                                          num_channels=1,
-                                                          num_patches=256,
-                                                          num_classes=40,
-                                                          skip_mult=True,
-                                                          dropout=0.2,
-                                                          input_size=IMAGE_SIZE,
-                                                          lr=LEARNING_RATE,
-                                                          )
-        
-
-        self.agent = DQN(controller_name='ros2_controller', model='ros2_controller', input_size=self.detector.flatten_size, train=True, test=False, resume=False)
-
-    def connect_networks(self, x):
-        #dois modos: congelar detetor, ou treinar detetor
-
-
-        self.x = self.detector.forward(x, Lander_Class=True)
-
-        res = self.agent.train(self.x.flatten())
-        print(res)
-
-    #metodo para teste inferencia
-
-
-
 """ Device """
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print('Device: ', device)
-
-
 
 def main():
     rclpy.init(args=None)
