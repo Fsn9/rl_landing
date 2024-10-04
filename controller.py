@@ -231,7 +231,7 @@ class RL:
 
     def finish(self):
         print('Finishing RL process')
-        self.run.finish() # closes wandb
+        # self.run.finish() # closes wandb
 
     def learn(self):
         # based on random mini batch, perform gradient step on the policy
@@ -298,34 +298,28 @@ class Lander(ROS2Controller):
     def __call__(self):
         print('Lander.__call__')
 
-        """ 1. Detector """
-        # 1) chamar o Detetor.observe para processar as mensagens do ROS
-        # 1.1) passar esse processamento pelo detetor
-        obs = Detector.observe(self.cur_vis_data)
-        embeddings = self.detector(obs, Lander_Class=True)
-        print('Embeddings', embeddings.shape)
         pos = self.cur_position # save current position of agent in the world (global knowledge) for the reward function
 
-        """ 2. Agent """
-        # 2) com os embeddings do detetor passá-lo pelo agente e recolher as açoes
-        action = self.agent.decide(state=embeddings)
-        print('Action', action)
+        """ 1. Detector """
+        obs = Detector.observe(self.cur_vis_data)
+        embeddings = self.detector(obs, Lander_Class=True)
 
-        # 3) Atuar no world com essas açoes
+        """ 2. Agent """
+        action = self.agent.decide(state=embeddings)
+
+        """ 3. Lander acts in environment with agent's actions """
         self.act(*self.agent.action_space[action.item()])
 
-        # 4) esperar um pouco até norma entre estados is bigger than n=0.25 or duration above 5secs
-        """ Get state until state changes """
+        """ 4. Wait for state change and save next state"""
         state_start_time = time.time()
         while True:
-            """ 3. Spin again to get next position from callbacks """
-            self.spin() # TODO this should wait for change of state
+            self.spin() # roll callbacks to update data observed (TODO: how to ensure rolling all callbacks?)
 
-            """ 4. Get next state """
-            # 5) fazer 1) e 1.1) outra vez
+            """ Get next state """
             obs = Detector.observe(self.cur_vis_data)
             next_embeddings = self.detector(obs, Lander_Class=True)
-            next_pos = self.cur_position # save current position of agent in the world (global knowledge) for the reward function
+            
+            next_pos = self.cur_position # save next position of agent in the world (global knowledge) for the reward function
 
             distance_between_states = norm(embeddings - next_embeddings) # TODO i could do diff between embs or images
             print('norm between states: ', distance_between_states)
@@ -333,7 +327,8 @@ class Lander(ROS2Controller):
             """ If distance covered is bigger than 0.25 or transition duration above 5 seconds """
             if distance_between_states >= 0.25 or (time.time() - state_start_time) >= 5:
                 break
-        # 6) fazer o train() com a informacao toda.
+        
+        """ 5. Train the agent """
         self.agent.train(state=embeddings,action=action,next_state=next_embeddings,cur_position=pos,next_position=next_pos)
         exit()
 
@@ -651,7 +646,7 @@ class DQN(RL):
             writer = csv.writer(metrics_file)
             writer.writerow([avg_reward,self.num_landings,self.num_crashes])
         """ Wandb log """
-        self.run.log({"avg reward": avg_reward, "num_landings": self.num_landings, "num_crashes": self.num_crashes, "epsilon": self.epsilon})
+        # self.run.log({"avg reward": avg_reward, "num_landings": self.num_landings, "num_crashes": self.num_crashes, "epsilon": self.epsilon})
         return avg_reward
 
     """ Returns if terminated flag and the reason """
@@ -786,8 +781,6 @@ class DQN(RL):
         """ 5. Get reward """
         reward = self.compute_reward(state, action, next_state, termination, cur_position, next_position) # TODO update reward because now i cant make
         print('reward: ', reward)
-        exit()
-        # R(s,a,s')?!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
         """ 6. Store experience """
         self.store(state, action, reward, next_state, termination)
@@ -797,7 +790,7 @@ class DQN(RL):
 
         print(f'# EPISODE {self.num_episodes} | step {self.counter_steps}')
         print('state: ', state, 'action: ', action, 'next state: ', next_state, 
-              'reward: ', reward, 'termination: ', termination, 'landing target', self.landing_target_position,'\n')
+              'reward: ', reward, 'termination: ', termination, 'landing target', self.world_ptr.landing_target_position,'\n')
 
         """ 9. If so, reset episode"""
         if termination[0].item(): # If episode ended
@@ -838,14 +831,14 @@ class DQN(RL):
                 self.max_reward = avg_reward
 
             self.reset() # decays epsilon and new landing target
-            return (termination[0], termination[1], self.landing_target_position) # returns termination cause and new marker position
+            return (termination[0], termination[1], self.world_ptr.landing_target_position) # returns termination cause and new marker position
         
         if self.num_episodes == self.max_episodes:
             print('Ended Learning')
             # TODO launch here the test after training
-            return (termination[0], termination[1], self.landing_target_position) # returns termination cause and new marker position
+            return (termination[0], termination[1], self.world_ptr.landing_target_position) # returns termination cause and new marker position
         
-        return (termination[0], termination[1], self.landing_target_position) # returns termination cause and new marker position # what returns if everything is ok
+        return (termination[0], termination[1], self.world_ptr.landing_target_position) # returns termination cause and new marker position # what returns if everything is ok
     
     def __call__(self,x):
         if self.to_train:
