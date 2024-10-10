@@ -8,9 +8,10 @@
     "num_patches": 256,
     "num_classes": 40,
     "skip_mult": true,
-    "input_size": 160,
+    "input_size": 120,
     "lr": 0.0003,
     "dropout": 0.2,
     "active_modalities": [0,1,2],
-    "base_channels": 16
+    "base_channels": 16,
+    "initial_position": [2,2,0]
 }

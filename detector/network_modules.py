@@ -359,7 +359,7 @@ class VisionTransformer(nn.Module):
         x = x.transpose(0, 1) if HEAD_TYPE != 'd' and HEAD_TYPE != 'g' and HEAD_TYPE != 'h' else x
         #return x for Detector+DQN
         if Lander_Class: # TODO change naming
-          return x
+          return x.squeeze(dim=0)
 
         """ [Stage 6] """
         """ Perform prediction (depends on head type) """

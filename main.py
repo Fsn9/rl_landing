@@ -214,7 +214,21 @@ def takeoff_mission(connection, altitude):
 
 def land_mission(connection):
     """ Set guided """
-    set_mode(connection, 'LAND')
+    # set_mode(connection, 'LAND')
+    print(f'Sending MAV_CMD_NAV_LAND')
+    connection.mav.command_long_send(
+        connection.target_system,        # Target system ID
+        connection.target_component,     # Target component ID
+        mavutil.mavlink.MAV_CMD_NAV_LAND,  # Command ID for takeoff
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+    )
     disarm(connection, timeout=15)
 
 def set_thrusters(connection, rf_pwm, lf_pwm, rb_pwm, lb_pwm):
@@ -284,20 +298,20 @@ def detection_mission(connection):
             print('Interrupted mission')
 
 def autonomous_mission(connection):
-    # """ Land first """
-    # land_mission(connection)
+    """ Land first """
+    land_mission(connection)
 
-    # """ Set guided """
-    # set_mode(connection, 'GUIDED')
+    """ Set guided """
+    set_mode(connection, 'GUIDED')
 
-    # """ Arm """
-    # arm(connection)
+    """ Arm """
+    arm(connection)
 
-    # """ Takeoff """
-    # takeoff(connection, altitude=3, block=True)
+    """ Takeoff """
+    takeoff(connection, altitude=3, block=True)
 
-    """ Initialize controller """
-    controller = load_system(
+    """ Initialize system """
+    system = load_system(
             name=ap.system_name, 
             to_train=ap.train, 
             to_test=ap.test, 
@@ -309,28 +323,30 @@ def autonomous_mission(connection):
             freeze=ap.freeze,
             pkg_path=PKG_PATH
     )
-    print(f'Initialized controller {ap.system_name}')
+    print(f'Initialized system {ap.system_name}')
 
     """ Start control cycle """
     try:
         while True:
-            """ Call controller, meaning, rolling an RL interaction """
-            report = controller() # report return has e.g., (episode ended: bool, ending cause: landed, new_target_pose: np.array)
-            exit() # TODO here
-            if report[0].item(): # if terminated episode from controller, restart UAV to new position
+            """ Call system, meaning, rolling an RL interaction """
+            report = system() # report return has e.g., (episode ended: bool, ending cause: landed, new_target_pose: np.array)
+
+            if report[0].item(): # if terminated episode from system, restart UAV to new position
                 print('Ended episode. Resetting UAV and marker')
 
-                controller.set_gz_model_pose('artuga_0', report[2])
+                #system.set_gz_model_pose('artuga_0', report[3]) # TODO truncate to +-[2,6] positions
 
                 land_mission(connection)
 
-                takeoff_mission(connection, altitude=randint(1,7)) # put random height and position
+                takeoff_mission(connection, altitude=randint(3,7)) # put random height and position
+
+                system.reset() # reset system functionality
 
             """ Set pace """
             time.sleep(ap.control_period) # TODO check if state changed instead of periodic control
             
     except KeyboardInterrupt:
-            controller.finish()
+            system.finish()
             land_mission(connection)
             print('Interrupted mission')
 

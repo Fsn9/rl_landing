@@ -44,18 +44,26 @@ import os
 from rl_landing.agent import *
 from rl_landing.illegal_actions import IllegalActions
 import json
+
+from copy import deepcopy
+
 current_GMT = time.gmtime()
 timestamp = str(calendar.timegm(current_GMT))
+
+POSSIBLE_ARTUGA_COORDINATES = [2,6,-2,-6]
+INITIAL_POSITION = np.array([2,2,0])
+INPUT_SIZE = 120
+NEST_WIDTH = 1.5
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 #resize = Resize(size = ACTUAL_SIZE_TUPLE, antialias=True)
 to_grayscale = Grayscale()
 to_tensor = ToTensor()
-observation = torch.zeros((1, 160, 160)).to(DEVICE)
+black_observation = torch.zeros((1, INPUT_SIZE, INPUT_SIZE)).to(DEVICE) # C,H,W
+empty_rgb_observation = torch.zeros((INPUT_SIZE, INPUT_SIZE, 3)).to(DEVICE) # H,W,C
 count_frames = 0
 
-POSSIBLE_ARTUGA_COORDINATES = [2,6,-2,-6]
 
 """
 class ROS2Controller that has:
@@ -88,7 +96,8 @@ class ROS2Controller(Node):
 
         self.vis_img_sub = self.create_subscription(Image,'/visual_camera/image',self.vis_img_cb,qos_policy)
         self.vis_img_sub  # prevent unused variable warning
-        self.cur_vis_img = None
+        self.cur_vis_data = None
+        self.cur_vis_img = black_observation
         self.count_vis_frames = 0
 
         """ Publishers """
@@ -99,17 +108,20 @@ class ROS2Controller(Node):
         """ ROS2 api node """
         self.node_set_gz_pose = transport13.Node()
 
+        """ Roll callbacks enabling systems to get first data """
+        self.spin()
+
         """ Landing target object """
         self.maximum_distance_landing_target = 8 # TODO remove this
-        self.reset_marker()
+        position = INITIAL_POSITION # TODO this should come from config
+        self.reset_marker(position)
 
         print(f'Initialized ROS2 Controller {self.name}')
-
-        self.spin() # Roll callbacks enabling systems to get first data
     
-    def update_marker_position(self):
-        self.landing_target_position = [random.choice(POSSIBLE_ARTUGA_COORDINATES),random.choice(POSSIBLE_ARTUGA_COORDINATES), 0.0]
-        self.landing_target_position[2] = 0.0
+    def update_marker_position(self, position):
+        #self.landing_target_position = [random.choice(POSSIBLE_ARTUGA_COORDINATES),random.choice(POSSIBLE_ARTUGA_COORDINATES), 0.0]
+        #self.landing_target_position[2] = 0.0
+        self.landing_target_position = position # TODO truncate to [2,6]
 
     """ Gazebo set model service"""
     def set_gz_model_pose(self, name, pose):
@@ -134,15 +146,16 @@ class ROS2Controller(Node):
         else:
             print("Service call failed.")
     
-    def reset_marker(self):
-        self.update_marker_position()
-        self.set_gz_model_pose('artuga_0',self.landing_target_position)
+    def reset_marker(self, position):
+        position[-1] = 0.0
+        self.update_marker_position(position)
+        self.set_gz_model_pose('artuga_0', position)
 
     def spin(self):
         rclpy.spin_once(self)
 
     def pose_cb(self, msg):
-        self.cur_position = np.array([msg.pose.position.x,msg.pose.position.y,msg.pose.position.z])
+        self.cur_position = np.array([msg.pose.position.x,msg.pose.position.y,msg.pose.position.z]) + INITIAL_POSITION # the sum is to convert from local to global
         # self.get_logger().info('I heard position.x: "%s"' % msg.pose.position)
     
     def gps_cb(self, msg):
@@ -150,19 +163,11 @@ class ROS2Controller(Node):
         # self.get_logger().info('I heard gps altitude: "%s"' % msg.position)
     
     def vis_img_cb(self, msg):
-        global count_frames, observation, resize
+        global count_frames, black_observation, resize
         
         self.count_vis_frames += 1
 
         self.cur_vis_data = msg.data # Save msg
-
-    # def action_pub(self):
-    #     msg = TwistStamped()
-    #     msg.header.frame_id = "base_link"
-    #     msg.twist.linear.z = 1.0 if self.i % 2 == 0 else -1.0
-    #     self.publisher_.publish(msg)
-    #     self.get_logger().info('Publishing: "%s"' % msg.twist)
-    #     self.i += 1
 
     def __call__(self, vx, vy, vz):
         msg = TwistStamped()
@@ -171,7 +176,6 @@ class ROS2Controller(Node):
 
         msg.twist.linear.x = vx
         msg.twist.linear.y = vy
-        #msg.twist.linear.z = 1.0 if self.i % 2 == 0 else -1.0
         msg.twist.linear.z = vz
         
         self.i += 1
@@ -191,7 +195,7 @@ class RL:
         self.cumulative_reward = 0
         
         """ Initialize wandb log platform """
-        # if to_train:
+        # if params.get('to_train'): # TODO should be checked the --log arg in arg parser instead
         #     wandb.login()
         #     self.run = wandb.init(
         #         project="rl_landing",
@@ -231,7 +235,7 @@ class RL:
 
     def finish(self):
         print('Finishing RL process')
-        # self.run.finish() # closes wandb
+        #self.run.finish() # closes wandb
 
     def learn(self):
         # based on random mini batch, perform gradient step on the policy
@@ -299,10 +303,12 @@ class Lander(ROS2Controller):
         print('Lander.__call__')
 
         pos = self.cur_position # save current position of agent in the world (global knowledge) for the reward function
+        print('UAV position: ', self.cur_position)
 
         """ 1. Detector """
         obs = Detector.observe(self.cur_vis_data)
         embeddings = self.detector(obs, Lander_Class=True)
+        print('Embeddings shape: ', embeddings.shape)
 
         """ 2. Agent """
         action = self.agent.decide(state=embeddings)
@@ -317,43 +323,34 @@ class Lander(ROS2Controller):
 
             """ Get next state """
             obs = Detector.observe(self.cur_vis_data)
-            next_embeddings = self.detector(obs, Lander_Class=True)
-            
+            with torch.no_grad(): # Does not require gradients to observe next state
+                next_embeddings = self.detector(obs, Lander_Class=True)
+
             next_pos = self.cur_position # save next position of agent in the world (global knowledge) for the reward function
 
             distance_between_states = norm(embeddings - next_embeddings) # TODO i could do diff between embs or images
-            print('norm between states: ', distance_between_states)
             
             """ If distance covered is bigger than 0.25 or transition duration above 5 seconds """
             if distance_between_states >= 0.25 or (time.time() - state_start_time) >= 5:
+                print('norm between states: ', distance_between_states)
                 break
         
         """ 5. Train the agent """
-        self.agent.train(state=embeddings,action=action,next_state=next_embeddings,cur_position=pos,next_position=next_pos)
-        exit()
-
-        # PERGUNTA FULCRAL: faço isto tudo internamento ao DQN como está (e feio), ou tudo controlado pelo lander?
-        # melhor se for o lander a fazer este loop.
-        # a) o DQN passa a ter entao o actions = decide(x) e nao um act()
-        # b) o Lander atua no world
-        # c) e o detetor antes de a) e depois de b) processa a mensagem que é atualizada no spin()
-        ## DEVE SER PORTANTO O LANDER A GERIR ESTE PIPELINE todo!
-
-    # def connect_networks(self, x): # TODO change to learn
-    #     # self.x = self.detector.forward(x, Lander_Class=True)
-    #     # res = self.agent.train(self.x.flatten())
-    #     # print(res)
-    #     pass
+        return self.agent.train(state=embeddings,action=action,next_state=next_embeddings,prev_pos=pos,next_pos=next_pos)
 
     def act(self, *action):
-        print('action: ', *action)
         super().__call__(*action) # Performs the actions in the inherited environment
 
     def forward(self, x):
         x = self.detector(x, Lander_Class=True)
-        print('Embeddings', x.shape)
         action = self.agent(x)
-        print('Action', action)
+
+    """ Resets the system. It is the same as resetting the agent """
+    def reset(self):
+        self.agent.reset()
+
+    def finish(self):
+        self.agent.finish()
 
 class Detector(ROS2Controller):
     def __init__(self, params):
@@ -394,7 +391,7 @@ class Detector(ROS2Controller):
         self.spin()
         np_arr = np.frombuffer(self.cur_vis_data, np.uint8) # convert sensor_msgs/Image to numpy
         # TODO put in [0,1] float
-        np_arr = np.reshape(np_arr, (160, 160, 3)) # Reshape it as RGB 160x160 and batch size = 1
+        np_arr = np.reshape(np_arr, (INPUT_SIZE, INPUT_SIZE, 3)) # Reshape it as RGB 160x160 and batch size = 1
         tensor = to_tensor(np.array(np_arr)).to(DEVICE) # Convert to torch.tensor
         tensor = to_grayscale(tensor) # Convert from RGB to grayscale
         img = ToPILImage()(tensor) # TODO remove after debug
@@ -404,13 +401,15 @@ class Detector(ROS2Controller):
     
     @staticmethod
     def observe(cur_vis_data):
+        if cur_vis_data is None: # To avoid callbacks not being rolled in the beginning
+            return empty_rgb_observation.unsqueeze(0)
         np_arr = np.frombuffer(cur_vis_data, np.uint8) # convert sensor_msgs/Image to numpy
         # TODO put in [0,1] float
-        np_arr = np.reshape(np_arr, (160, 160, 3)) # Reshape it as RGB 160x160 and batch size = 1
+        np_arr = np.reshape(np_arr, (INPUT_SIZE, INPUT_SIZE, 3)) # Reshape it as RGB 160x160 and batch size = 1
         tensor = to_tensor(np.array(np_arr)).to(DEVICE) # Convert to torch.tensor
         tensor = to_grayscale(tensor) # Convert from RGB to grayscale
 
-        tensor = torch.cat((observation,observation,tensor), dim=0) # TODO this fakes R and G channel and makes a transforms a (1,H,W) tensor into a (3,H,W)
+        tensor = torch.cat((black_observation,black_observation,tensor), dim=0) # TODO this fakes R and G channel and makes a transforms a (1,H,W) tensor into a (3,H,W)
 
         img = ToPILImage()(tensor) # TODO remove after debug
         img.save('/home/francisco/Downloads/pil.png')
@@ -430,7 +429,7 @@ class Detector(ROS2Controller):
         # print(img_tensor.shape)
         # obs = img_tensor
 
-        obs = torch.cat((observation,observation,self.cur_vis_img), dim=0) # TODO this fakes R and G channel
+        obs = torch.cat((black_observation,black_observation,self.cur_vis_img), dim=0) # TODO this fakes R and G channel
         
         """ Fake LiDAR """
         FAKE_LIDAR = True
@@ -460,7 +459,7 @@ class Detector(ROS2Controller):
     def publish(self, image, bbox, objectness):
         # image should be in HWC
         RESIZE = 2 # TODO these two lines should be in config
-        IMAGE_SIZE = tuple(np.array([160,160],dtype=np.uint16) * RESIZE)
+        IMAGE_SIZE = tuple(np.array([INPUT_SIZE,INPUT_SIZE],dtype=np.uint16) * RESIZE)
         FONT_SCALE = 0.2 * RESIZE
 
         """ Prepare formats """
@@ -553,7 +552,7 @@ class DQN(RL):
         self.epsilon_decay = -self.epsilon_i / self.final_episode_epsilon_decay
         
         self.memory_capacity = 1000
-        self.batch_size = 8
+        self.batch_size = 1
         self.memory = ReplayMemory(self.memory_capacity, self.batch_size)
 
         """ If test or resume args active, load models """
@@ -581,6 +580,7 @@ class DQN(RL):
         self.CRITICAL_HEIGHT_MIN = 0.5
         self.CRITICAL_HEIGHT_MAX = 8
         self.LANDED_ALLOWED_DIAMETER = 1 # TODO should be the diameter of the platform
+        self.FIELD_OF_VIEW_THRESHOLD = 1
         self.num_crashes = 0
         self.num_landings = 0
         self.max_reward = -1000
@@ -593,8 +593,6 @@ class DQN(RL):
         self.state = self.observe()
         print('Initial state:', self.state)
 
-        self.reset()
-
     def decay_epsilon(self):
         self.epsilon = max(self.epsilon_decay * self.num_episodes + self.epsilon_i, self.epsilon_f)
     
@@ -603,40 +601,55 @@ class DQN(RL):
     
     """ On end episode decay epsilon and resets landing target position """
     def reset(self):
+        self.world_ptr.spin() # spin callbacks to get last UAV position
+
         self.decay_epsilon()
-        self.world_ptr.reset_marker()
-        print(f'Reseting episode and new epsilon of {self.epsilon}')
+
+        """ Get position of UAV and assign it to marker """
+        position = deepcopy(self.world_ptr.cur_position) # Get last received position of UAV. That will be the new marker position
+        position += np.random.rand(3) * NEST_WIDTH # sum some randomness to start not exactly aligned with UAV
+        self.world_ptr.reset_marker(position)
+
+        print(f'Reseting episode and new epsilon of {self.epsilon} and new marker position of {position}')
     
     """
     returns a torch.tensor of the difference between the current pose and the landing target position
     """
     def observe(self):
         if self.world_ptr.cur_position is None: # To contour bug of position callbacks not being rolled
-            self.world_ptr.cur_position = np.zeros((3,))
+            self.world_ptr.cur_position = INITIAL_POSITION
         return torch.tensor(self.world_ptr.cur_position - self.world_ptr.landing_target_position).float().to(self.device)
 
-    def compute_reward(self, state, action, next_state, termination, cur_position, next_position):
+    def compute_reward(self, state, action, next_state, termination, prev_pos, next_pos):
         _, reason = termination[0], termination[1]
 
-        dx, dy, dz = abs(next_position[0]) - abs(cur_position[0]), abs(next_position[1]) - abs(cur_position[1]), abs(next_position[2]) - abs(cur_position[2])
+        prev_dist_to_marker = prev_pos - self.world_ptr.landing_target_position
+        next_dist_to_marker = next_pos - self.world_ptr.landing_target_position
+
+        dist = np.abs(prev_dist_to_marker) - np.abs(next_dist_to_marker)
+
+        dx, dy, dz = dist[0], dist[1], dist[2]
         
-        print(cur_position, next_position)
-        print(dx,dy,dz)
+        print('def compute_reward')
+        print('prev dist: ', prev_dist_to_marker)
+        print('next dist: ', next_dist_to_marker)
+        print('dist:', dist)
+        print('dx,dy,dz:',dx,dy,dz)
 
         if reason == "landed":
             self.num_landings += 1
-            return torch.tensor(2).to(self.device)
+            return torch.tensor(2, dtype=torch.float32).to(self.device)
         elif reason == "crashed":
             self.num_crashes += 1
-            return torch.tensor(-2).to(self.device)
+            return torch.tensor(-2, dtype=torch.float32).to(self.device)
         else:
             # TODO falta normalizar, ou seja descobrir o MAX_DZ, MAX_DY, MAX_DX
             reward_sum = 0
-            reward_sum += 0.33 * (1 - 2 * (dx >= 0)) # incentivizes approaching in x
-            reward_sum += 0.33 * (1 - 2 * (dy >= 0)) # incentivizes approaching in y
-            reward_sum += 0.33 * (1 - 2 * (dz >= 0)) # incentivizes approaching in z
+            reward_sum += 0.33 * (dx > 0) # incentivizes approaching in x
+            reward_sum += 0.33 * (dy > 0) # incentivizes approaching in y
+            reward_sum += 0.33 * (dz > 0) # incentivizes approaching in z # TODO beneficiar mais altura? (aumentar o ganho kz?)
             self.cumulative_reward += reward_sum
-            return reward_sum
+            return torch.tensor(reward_sum, dtype=torch.float32).to(self.device)
     
     def log_metrics(self):
         global timestamp
@@ -646,7 +659,7 @@ class DQN(RL):
             writer = csv.writer(metrics_file)
             writer.writerow([avg_reward,self.num_landings,self.num_crashes])
         """ Wandb log """
-        # self.run.log({"avg reward": avg_reward, "num_landings": self.num_landings, "num_crashes": self.num_crashes, "epsilon": self.epsilon})
+        #self.run.log({"avg reward": avg_reward, "num_landings": self.num_landings, "num_crashes": self.num_crashes, "epsilon": self.epsilon})
         return avg_reward
 
     """ Returns if terminated flag and the reason """
@@ -660,6 +673,11 @@ class DQN(RL):
         # if out of allowed area
         if abs(x_pos) > self.MAX_X or abs(y_pos) > self.MAX_Y or z_pos > self.MAX_Z or z_pos <= 0:
             return torch.tensor(True), "outside"
+
+        # if artuga is outside the field of view
+        dist_to_marker = np.abs(self.world_ptr.cur_position)[:2] - np.abs(self.world_ptr.landing_target_position)[:2]
+        if any(dist_to_marker > self.FIELD_OF_VIEW_THRESHOLD):
+            return torch.tensor(True), "outside_fov"
         
         # if crashed
         if (z_pos < self.CRITICAL_HEIGHT_MIN or z_pos <= 0) and ((abs(state[0]) > self.LANDED_ALLOWED_DIAMETER) or (abs(state[1]) > self.LANDED_ALLOWED_DIAMETER)):
@@ -694,7 +712,7 @@ class DQN(RL):
         reward_batch = torch.stack(reward_batch, dim=0).to(self.device)
         termination_batch = torch.stack(termination_batch, dim=0).to(self.device)
         #termination_batch[0] = True # TODO remove
-        non_terminated_idxs = (termination_batch == False).nonzero().squeeze() # squeeze because it delivers (B,1). I want (B,)
+        non_terminated_idxs = (termination_batch == False).nonzero().squeeze(dim=1) # squeeze because it delivers (B,1). I want (B,)
 
         self.main_net.train()
 
@@ -714,7 +732,7 @@ class DQN(RL):
         td_target = reward_batch + self.gamma * next_qs
         loss = self.criterion(selected_qs, td_target.unsqueeze(1)) # target shape (8) to (8,1)
         self.optimizer.zero_grad()
-        loss.backward()
+        loss.backward(retain_graph=True)
 
         """ Gradient clipping """
         #torch.nn.utils.clip_grad_value_(self.main_net.parameters(), 100) # clip gradients between 100 and -100
@@ -770,7 +788,7 @@ class DQN(RL):
         super().__call__(*self.action_space[action.item()]) # send actions to ROS simulator
         return
 
-    def train(self, state, action, next_state, cur_position, next_position):
+    def train(self, state, action, next_state, prev_pos, next_pos):
         """ Update some metric variables """
         self.counter_steps += 1
         self.counter_episodic_steps += 1
@@ -779,8 +797,7 @@ class DQN(RL):
         termination = self.terminated(state, action, next_state)
 
         """ 5. Get reward """
-        reward = self.compute_reward(state, action, next_state, termination, cur_position, next_position) # TODO update reward because now i cant make
-        print('reward: ', reward)
+        reward = self.compute_reward(state, action, next_state, termination, prev_pos, next_pos)
 
         """ 6. Store experience """
         self.store(state, action, reward, next_state, termination)
@@ -788,8 +805,7 @@ class DQN(RL):
         """ 7. Learn """
         self.learn()
 
-        print(f'# EPISODE {self.num_episodes} | step {self.counter_steps}')
-        print('state: ', state, 'action: ', action, 'next state: ', next_state, 
+        print(f'# EPISODE {self.num_episodes} | step {self.counter_steps}','state: ', state, 'action: ', action, 'next state: ', next_state, 
               'reward: ', reward, 'termination: ', termination, 'landing target', self.world_ptr.landing_target_position,'\n')
 
         """ 9. If so, reset episode"""
@@ -830,17 +846,18 @@ class DQN(RL):
                 }, self._best_target_model_path)
                 self.max_reward = avg_reward
 
-            self.reset() # decays epsilon and new landing target
-            return (termination[0], termination[1], self.world_ptr.landing_target_position) # returns termination cause and new marker position
+            self.world_ptr.spin() # last call to callbacks
+
+            return (termination[0], termination[1]) # returns termination cause and new marker position
         
         if self.num_episodes == self.max_episodes:
             print('Ended Learning')
             # TODO launch here the test after training
-            return (termination[0], termination[1], self.world_ptr.landing_target_position) # returns termination cause and new marker position
+            return (termination[0], termination[1]) # returns termination cause and new marker position
         
-        return (termination[0], termination[1], self.world_ptr.landing_target_position) # returns termination cause and new marker position # what returns if everything is ok
+        return (termination[0], termination[1]) # returns termination cause and new marker position # what returns if everything is ok
     
-    def __call__(self,x):
+    def __call__(self,x): # passar args aqui
         if self.to_train:
             return self.train(x)
         else:
