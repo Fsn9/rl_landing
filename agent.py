@@ -13,7 +13,7 @@ from rl_landing.ros2_msg import *
 
 from rl_landing.networks import neural_network
 
-from rl_landing.replay_memory import Transition, memory
+from rl_landing.replay_buffers import Transition, memory
 
 writer = SummaryWriter(log_dir=f"Reward_size_{str(GRID_RESOL)}")
 

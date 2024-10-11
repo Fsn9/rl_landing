@@ -19,6 +19,7 @@ parser.add_argument('--takeoff_altitude', type=float, required=False, default=6.
 parser.add_argument('--control_period', type=float, required=False, default=3.0)
 parser.add_argument('--detection_period', type=float, required=False, default=0.1)
 parser.add_argument('--system_name', type=str, required=False, choices=['dummy','dqn','lander','vital'], default='dummy')
+parser.add_argument('--agent', type=str, required=False, choices=['dqn','ppo','sac'], default='dqn')
 
 parser.add_argument('--train', action='store_true', help = "It trains from scratch or trains from given model if --resume is True")
 parser.add_argument('--test', action='store_true', help = "It tests the given model")
@@ -27,6 +28,8 @@ parser.add_argument('--resume', action='store_true', help="It resumes training o
 parser.add_argument('--model_path', type=str, required=False, default='', help="This is the path to the model to test (.ckpt or .pt)")
 parser.add_argument('--run_path', type=str, required=False, default='', help="This is the path to the run to resume training")
 parser.add_argument('--config_file', type=str, required=False, default='', help="This is the configuration containing the parameters in a .json file of the attributes of the model to test")
+parser.add_argument('--log', type=str, required=False, default='', help="This is the configuration containing the parameters in a .json file of the attributes of the model to test")
+# TODO acrescenter arg --verbose para dar output de debug ao user
 
 ap = parser.parse_args()
 
@@ -312,16 +315,18 @@ def autonomous_mission(connection):
 
     """ Initialize system """
     system = load_system(
-            name=ap.system_name, 
+            name=ap.system_name,
+            agent=ap.agent,
             to_train=ap.train, 
             to_test=ap.test, 
-            to_resume=ap.resume, 
+            to_resume=ap.resume,
+            log=ap.log,
             model_path=ap.model_path,
             run_path=ap.run_path,
             mission=ap.mission,
             config_file=ap.config_file,
             freeze=ap.freeze,
-            pkg_path=PKG_PATH
+            pkg_path=PKG_PATH,
     )
     print(f'Initialized system {ap.system_name}')
 
@@ -334,8 +339,6 @@ def autonomous_mission(connection):
             if report[0].item(): # if terminated episode from system, restart UAV to new position
                 print('Ended episode. Resetting UAV and marker')
 
-                #system.set_gz_model_pose('artuga_0', report[3]) # TODO truncate to +-[2,6] positions
-
                 land_mission(connection)
 
                 takeoff_mission(connection, altitude=randint(3,7)) # put random height and position
@@ -344,6 +347,8 @@ def autonomous_mission(connection):
 
             """ Set pace """
             time.sleep(ap.control_period) # TODO check if state changed instead of periodic control
+            # TODO also increase control period proportional to real time factor
+            # e.g., control period * 1/real time factor
             
     except KeyboardInterrupt:
             system.finish()

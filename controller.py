@@ -15,7 +15,7 @@ from rl_landing.networks import OneLayerMLP
 
 from rl_landing.detector.network_modules import VisionTransformer
 
-from rl_landing.replay_memory import ReplayMemory
+from rl_landing.replay_buffers import ReplayMemory, RolloutBuffer
 
 from torchvision.transforms import ToTensor, Grayscale, Resize, ToPILImage
 
@@ -154,14 +154,17 @@ class ROS2Controller(Node):
     def spin(self):
         rclpy.spin_once(self)
 
+    # TODO impose period of callback dependent on the real time factor
     def pose_cb(self, msg):
         self.cur_position = np.array([msg.pose.position.x,msg.pose.position.y,msg.pose.position.z]) + INITIAL_POSITION # the sum is to convert from local to global
         # self.get_logger().info('I heard position.x: "%s"' % msg.pose.position)
     
+    # TODO impose period of callback dependent on the real time factor
     def gps_cb(self, msg):
         self.cur_gps = np.array([msg.position.latitude,msg.position.longitude,msg.position.altitude])
         # self.get_logger().info('I heard gps altitude: "%s"' % msg.position)
     
+    # TODO impose period of callback dependent on the real time factor
     def vis_img_cb(self, msg):
         global count_frames, black_observation, resize
         
@@ -195,12 +198,14 @@ class RL:
         self.cumulative_reward = 0
         
         """ Initialize wandb log platform """
-        # if params.get('to_train'): # TODO should be checked the --log arg in arg parser instead
-        #     wandb.login()
-        #     self.run = wandb.init(
-        #         project="rl_landing",
-        #         config=self.config,
-        #     )
+        if params.get('log'):
+            if params.get('to_train'):
+                wandb.login()
+                self.run = wandb.init(
+                    project="rl_landing",
+                    config=self.config,
+                )
+            # TODO also init in case of test
 
         """ Initialize revelant paths """
         self._pkg_path = params.get('pkg_path')
@@ -293,12 +298,17 @@ class Lander(ROS2Controller):
         self.detector = VisionTransformer(params)
         params['input_size'] = self.detector.flatten_size # TODO change this to @property
 
-        self.agent = DQN(params)
+        if params['agent'] == "dqn":
+            self.agent = DQN(params)
+        elif params['agent'] == "ppo":
+            self.agent = PPO(params)
+        elif params['agent'] == "sac":
+            pass
 
         print('Global parameters: ', params)
 
         self.params = params # Save params
-    
+
     def __call__(self):
         print('Lander.__call__')
 
@@ -311,10 +321,16 @@ class Lander(ROS2Controller):
         print('Embeddings shape: ', embeddings.shape)
 
         """ 2. Agent """
-        action = self.agent.decide(state=embeddings)
+        decision = self.agent.decide(state=embeddings)
 
-        """ 3. Lander acts in environment with agent's actions """
-        self.act(*self.agent.action_space[action.item()])
+        """ 3. Act and retrieve value """
+        if self.params['agent'] == 'dqn':
+            self.act(*self.agent.action_space[decision.item()])
+        elif self.params['agent'] == 'ppo':
+            self.act(*self.agent.action_space[decision[0].item()])
+            decision = decision, self.agent.value_net(embeddings) # ((action_idx, action_prob), value)
+        elif self.params['agent'] == 'sac':
+            pass
 
         """ 4. Wait for state change and save next state"""
         state_start_time = time.time()
@@ -331,12 +347,13 @@ class Lander(ROS2Controller):
             distance_between_states = norm(embeddings - next_embeddings) # TODO i could do diff between embs or images
             
             """ If distance covered is bigger than 0.25 or transition duration above 5 seconds """
+            # TODO instead of distance between embeddings, distance between gps positions
             if distance_between_states >= 0.25 or (time.time() - state_start_time) >= 5:
                 print('norm between states: ', distance_between_states)
                 break
         
         """ 5. Train the agent """
-        return self.agent.train(state=embeddings,action=action,next_state=next_embeddings,prev_pos=pos,next_pos=next_pos)
+        return self.agent.train(state=embeddings,decision=decision,next_state=next_embeddings,prev_pos=pos,next_pos=next_pos)
 
     def act(self, *action):
         super().__call__(*action) # Performs the actions in the inherited environment
@@ -512,6 +529,7 @@ class DQN(RL):
 
         # initalizes DQN offline or online
         ## if offline, does not initalize ROS stuff because it will learn from offline data
+        # TODO put these in RL class
         self.alpha = 0.00025
         self.gamma = 0.99
         self.epsilon_i = 1
@@ -552,7 +570,7 @@ class DQN(RL):
         self.epsilon_decay = -self.epsilon_i / self.final_episode_epsilon_decay
         
         self.memory_capacity = 1000
-        self.batch_size = 1
+        self.batch_size = 2
         self.memory = ReplayMemory(self.memory_capacity, self.batch_size)
 
         """ If test or resume args active, load models """
@@ -586,9 +604,10 @@ class DQN(RL):
         self.max_reward = -1000
 
         global timestamp
-        with open(os.path.join(self._run_path, 'metrics_' + timestamp + '.csv'), 'w', newline='') as metrics_file:
-            writer = csv.writer(metrics_file)
-            writer.writerow(['Avg reward','Num landings','Num crashes'])
+        if params.get('log'):
+            with open(os.path.join(self._run_path, 'metrics_' + timestamp + '.csv'), 'w', newline='') as metrics_file:
+                writer = csv.writer(metrics_file)
+                writer.writerow(['Avg reward','Num landings','Num crashes'])
 
         self.state = self.observe()
         print('Initial state:', self.state)
@@ -612,6 +631,7 @@ class DQN(RL):
 
         print(f'Reseting episode and new epsilon of {self.epsilon} and new marker position of {position}')
     
+    # TODO put observe in class RL
     """
     returns a torch.tensor of the difference between the current pose and the landing target position
     """
@@ -638,10 +658,10 @@ class DQN(RL):
 
         if reason == "landed":
             self.num_landings += 1
-            return torch.tensor(2, dtype=torch.float32).to(self.device)
+            return torch.tensor([2], dtype=torch.float32).to(self.device)
         elif reason == "crashed":
             self.num_crashes += 1
-            return torch.tensor(-2, dtype=torch.float32).to(self.device)
+            return torch.tensor([-2], dtype=torch.float32).to(self.device)
         else:
             # TODO falta normalizar, ou seja descobrir o MAX_DZ, MAX_DY, MAX_DX
             reward_sum = 0
@@ -649,7 +669,7 @@ class DQN(RL):
             reward_sum += 0.33 * (dy > 0) # incentivizes approaching in y
             reward_sum += 0.33 * (dz > 0) # incentivizes approaching in z # TODO beneficiar mais altura? (aumentar o ganho kz?)
             self.cumulative_reward += reward_sum
-            return torch.tensor(reward_sum, dtype=torch.float32).to(self.device)
+            return torch.tensor([reward_sum], dtype=torch.float32).to(self.device)
     
     def log_metrics(self):
         global timestamp
@@ -659,7 +679,8 @@ class DQN(RL):
             writer = csv.writer(metrics_file)
             writer.writerow([avg_reward,self.num_landings,self.num_crashes])
         """ Wandb log """
-        #self.run.log({"avg reward": avg_reward, "num_landings": self.num_landings, "num_crashes": self.num_crashes, "epsilon": self.epsilon})
+        if self.params['log']:
+            self.run.log({"avg reward": avg_reward, "num_landings": self.num_landings, "num_crashes": self.num_crashes, "epsilon": self.epsilon})
         return avg_reward
 
     """ Returns if terminated flag and the reason """
@@ -668,26 +689,26 @@ class DQN(RL):
 
         # if max steps
         if self.counter_episodic_steps > self.MAX_STEPS:
-            return torch.tensor(True), "max_steps"
+            return torch.tensor([True]), "max_steps"
         
         # if out of allowed area
         if abs(x_pos) > self.MAX_X or abs(y_pos) > self.MAX_Y or z_pos > self.MAX_Z or z_pos <= 0:
-            return torch.tensor(True), "outside"
+            return torch.tensor([True]), "outside"
 
         # if artuga is outside the field of view
         dist_to_marker = np.abs(self.world_ptr.cur_position)[:2] - np.abs(self.world_ptr.landing_target_position)[:2]
         if any(dist_to_marker > self.FIELD_OF_VIEW_THRESHOLD):
-            return torch.tensor(True), "outside_fov"
+            return torch.tensor([True]), "outside_fov"
         
         # if crashed
         if (z_pos < self.CRITICAL_HEIGHT_MIN or z_pos <= 0) and ((abs(state[0]) > self.LANDED_ALLOWED_DIAMETER) or (abs(state[1]) > self.LANDED_ALLOWED_DIAMETER)):
-            return torch.tensor(True), "crashed"
+            return torch.tensor([True]), "crashed"
         
         # if landed
         if (z_pos < self.CRITICAL_HEIGHT_MIN) and (abs(state[0]) < self.LANDED_ALLOWED_DIAMETER) and (abs(state[1]) < self.LANDED_ALLOWED_DIAMETER):
-            return torch.tensor(True), "landed"
+            return torch.tensor([True]), "landed"
 
-        return torch.tensor(False), "none"
+        return torch.tensor([False]), "none"
     
     def learn(self):
         if len(self.memory) < self.batch_size:
@@ -712,7 +733,7 @@ class DQN(RL):
         reward_batch = torch.stack(reward_batch, dim=0).to(self.device)
         termination_batch = torch.stack(termination_batch, dim=0).to(self.device)
         #termination_batch[0] = True # TODO remove
-        non_terminated_idxs = (termination_batch == False).nonzero().squeeze(dim=1) # squeeze because it delivers (B,1). I want (B,)
+        non_terminated_idxs = (termination_batch.squeeze(dim=1) == False).nonzero().squeeze(dim=1) # squeeze because it delivers (B,1). I want (B,)
 
         self.main_net.train()
 
@@ -760,23 +781,23 @@ class DQN(RL):
         return y
 
     def e_greedy(self, state, train=False):
-        self.main_net.eval() # This deactivates batchnorm and dropout layers
-        if random.random() > self.epsilon: # exploit
-            print('Exploiting')
+        if random.random() > self.epsilon:
+            self.main_net.eval() # This deactivates batchnorm and dropout layers
             with torch.no_grad(): # disables gradient computation (requires_grad=False)
-                y = torch.argmax(self.main_net(state).detach().cpu().unsqueeze(0), axis = 1) # get argmax. action is in shape [1]
+                action = torch.argmax(self.main_net(state).detach().cpu().unsqueeze(0), axis = 1) # get argmax. action is in shape [1]
             if train: 
                 self.main_net.train()
-            return y
+            print('Exploiting')
+            return action
 
-        else: # explore
+        else:
             print('Exploring')
             return torch.randint(0, self.action_space_len, (1,))
 
     # def forward(self, x, train=False):
     #     self.main_net.eval()
     #     with torch.no_grad(): # disables gradient computation (requires_grad=False)
-    #         y = torch.argmax(self.main_net(x).detach().cpu().unsqueeze(0), axis = 1) # get argmax. action is in shape [1]
+    #         y = torch.argepsilonmax(self.main_net(x).detach().cpu().unsqueeze(0), axis = 1) # get argmax. action is in shape [1]
     #     if train: 
     #         self.main_net.train()
     #     return y
@@ -788,35 +809,37 @@ class DQN(RL):
         super().__call__(*self.action_space[action.item()]) # send actions to ROS simulator
         return
 
-    def train(self, state, action, next_state, prev_pos, next_pos):
+    def train(self, state, decision, next_state, prev_pos, next_pos):
         """ Update some metric variables """
         self.counter_steps += 1
         self.counter_episodic_steps += 1
 
+        action = decision
+
         """ Check termination """
         termination = self.terminated(state, action, next_state)
 
-        """ 5. Get reward """
+        """ Get reward """
         reward = self.compute_reward(state, action, next_state, termination, prev_pos, next_pos)
 
-        """ 6. Store experience """
+        """ Store experience """
         self.store(state, action, reward, next_state, termination)
 
-        """ 7. Learn """
+        """ Learn """
         self.learn()
 
         print(f'# EPISODE {self.num_episodes} | step {self.counter_steps}','state: ', state, 'action: ', action, 'next state: ', next_state, 
               'reward: ', reward, 'termination: ', termination, 'landing target', self.world_ptr.landing_target_position,'\n')
 
-        """ 9. If so, reset episode"""
+        """ If so, reset episode"""
         if termination[0].item(): # If episode ended
-            """ 9.1. Log metrics """
+            """ Log metrics """
             avg_reward = self.log_metrics() # log avg reward, num crashes, num lands, epsilon
 
             self.num_episodes += 1 # increment num of episodes
             self.counter_episodic_steps = 0 # reset counter episodic steps
 
-            """ 9.2. Save last model """
+            """ Save last model """
             """ Save main policy """
             torch.save({
             'episode': self.counter_episodic_steps,
@@ -830,7 +853,7 @@ class DQN(RL):
             'model_state_dict': self.target_net.state_dict(),
             }, self._last_target_model_path)
 
-            """ 9.3. Save best model if reward is the best """
+            """ Save best model if reward is the best """
             if avg_reward > self.max_reward:
                 """ Save main policy """
                 torch.save({
@@ -846,8 +869,7 @@ class DQN(RL):
                 }, self._best_target_model_path)
                 self.max_reward = avg_reward
 
-            self.world_ptr.spin() # last call to callbacks
-
+            self.reset() # decays epsilon and new landing target
             return (termination[0], termination[1]) # returns termination cause and new marker position
         
         if self.num_episodes == self.max_episodes:
@@ -862,6 +884,360 @@ class DQN(RL):
             return self.train(x)
         else:
             return self.test(x)
+
+class PPO(RL):
+    def __init__(self, params):
+        """ Args disambiguation """
+        self.params = params
+        
+        self.name = params.get('name')
+        self.to_train = params.get('to_train')
+        self.to_test = params.get('to_test')
+        self.to_resume = params.get('to_resume')
+        self.model_path = params.get('model_path')
+        self.pkg_path = params.get('pkg_path')
+        self.world_ptr = params.get('world_ptr')
+
+        self.best_target_model_path = self.model_path.replace("best", "best_target")
+        self.last_target_model_path = self.model_path.replace("best", "last_target")
+
+        # PPO specific parameters
+        # TODO put these in RL class
+        self.learning_rate = 3e-4
+        self.max_episodes = 1000
+        self.gamma = 0.99
+        self.lam = 0.95  # GAE (Generalized Advantage Estimation) lambda
+        self.clip_ratio = 0.2
+        self.update_epochs = 4  # number of policy updates per batch
+        self.batch_size = 8
+        self.minibatch_size = 4
+        self.entropy_coeff = 0.01
+
+        self.config = {
+            'learning_rate': self.learning_rate,
+            'gamma': self.gamma,
+            'lam': self.lam,
+            'clip_ratio': self.clip_ratio,
+            'update_epochs': self.update_epochs,
+            'batch_size': self.batch_size,
+            'minibatch_size': self.minibatch_size,
+            'entropy_coeff': self.entropy_coeff,
+        } # This will be the config in wandb init
+
+        super().__init__(params)
+
+        self.action_space = simple_actions
+        self.action_space_len = len(simple_actions)
+
+        self.input_size = params.get('input_size')
+        self.output_size = self.action_space_len
+
+        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+        """ Initialize neural nets setup """
+        self.policy_net = OneLayerMLP(self.input_size, self.output_size).to(self.device)
+        self.value_net = OneLayerMLP(self.input_size, 1).to(self.device) # output is V(s)
+
+        self.optimizer = optim.AdamW(list(self.policy_net.parameters()) + list(self.value_net.parameters()), lr=self.learning_rate)
+        # TODO perceber se o optimizer monitoriza os parametros das duas
+        ## 2 forwards e optimizer com as duas redes juntas
+        ## 2 optimizers, um por rede
+
+        # TODO criar variavel self.capacity
+        self.memory = RolloutBuffer(capacity=self.batch_size, minibatch_size=self.minibatch_size)
+
+        """ If test or resume args active, load models """
+        if self.model_path:
+            self.loaded_model = torch.load(self.model_path, weights_only=False) # This loads object
+            self.main_net.load_state_dict(self.loaded_model['model_state_dict'])
+            print(f'Loaded main model ({self.model_path})')
+
+            self.loaded_target_model = torch.load(self.best_target_model_path, weights_only=False)
+            self.target_net.load_state_dict(self.loaded_target_model['model_state_dict'])
+            print(f'Loaded target model ({self.best_target_model_path})')
+            
+            self.optimizer.load_state_dict(self.loaded_model['optimizer_state_dict'])
+            print(f'Loaded optimizer model ({self.optimizer})')
+
+        """ Metrics """ # TODO put this in config
+        self.counter_steps = 0
+        self.counter_episodic_steps = 0
+        self.num_episodes = 0
+        self.MAX_STEPS = 50
+        self.MAX_X = 8
+        self.MAX_Y = 8
+        self.MAX_Z = 8
+        self.cumulative_reward = 0
+        self.CRITICAL_HEIGHT_MIN = 0.5
+        self.CRITICAL_HEIGHT_MAX = 8
+        self.LANDED_ALLOWED_DIAMETER = 1 # TODO should be the diameter of the platform
+        self.FIELD_OF_VIEW_THRESHOLD = 1
+        self.num_crashes = 0
+        self.num_landings = 0
+        self.max_reward = -1000
+
+        global timestamp
+        if params.get('log'):
+            with open(os.path.join(self._run_path, 'metrics_' + timestamp + '.csv'), 'w', newline='') as metrics_file:
+                writer = csv.writer(metrics_file)
+                writer.writerow(['Avg reward','Num landings','Num crashes'])
+
+        self.state = self.observe()
+        print('Initial state:', self.state)
+
+    def store(self, state, action, reward, log_prob, value, done):
+        """ Store experience for PPO update """
+        self.memory.store(state, action, reward, log_prob, value, done)
+    
+    """ On end episode decay epsilon and resets landing target position """
+    def reset(self): # TODO this can be in class RL
+        self.world_ptr.spin() # spin callbacks to get last UAV position
+
+        """ Get position of UAV and assign it to marker """
+        position = deepcopy(self.world_ptr.cur_position) # Get last received position of UAV. That will be the new marker position
+        position += np.random.rand(3) * NEST_WIDTH # sum some randomness to start not exactly aligned with UAV
+        self.world_ptr.reset_marker(position)
+
+        print(f'Reseting episode and new marker position of {position}')
+    
+    # TODO put observe in class RL
+    """
+    returns a torch.tensor of the difference between the current pose and the landing target position
+    """
+    def observe(self):
+        if self.world_ptr.cur_position is None: # To contour bug of position callbacks not being rolled
+            self.world_ptr.cur_position = INITIAL_POSITION
+        return torch.tensor(self.world_ptr.cur_position - self.world_ptr.landing_target_position).float().to(self.device)
+
+    """ Sample action from policy distribution """
+    def select_action(self, state, train=False):
+        # TODO make use of the arg train
+        self.policy_net.eval()
+        with torch.no_grad():
+            logits = self.policy_net(state.unsqueeze(0))
+        action_prob = torch.softmax(logits, dim=-1)
+        action = torch.multinomial(action_prob, 1).view(1)  # sample action
+        if train:
+            self.policy_net.train()
+        return action, action_prob[:, action].view(1) # (tensor(action idx), tensor(soft_max probability))
+
+    def compute_reward(self, state, action, next_state, termination, prev_pos, next_pos):
+        _, reason = termination[0], termination[1]
+
+        prev_dist_to_marker = prev_pos - self.world_ptr.landing_target_position
+        next_dist_to_marker = next_pos - self.world_ptr.landing_target_position
+
+        dist = np.abs(prev_dist_to_marker) - np.abs(next_dist_to_marker)
+
+        dx, dy, dz = dist[0], dist[1], dist[2]
+        
+        print('def compute_reward')
+        print('prev dist: ', prev_dist_to_marker)
+        print('next dist: ', next_dist_to_marker)
+        print('dist:', dist)
+        print('dx,dy,dz:',dx,dy,dz)
+
+        if reason == "landed":
+            self.num_landings += 1
+            return torch.tensor([2], dtype=torch.float32).to(self.device)
+        elif reason == "crashed":
+            self.num_crashes += 1
+            return torch.tensor([-2], dtype=torch.float32).to(self.device)
+        else:
+            # TODO falta normalizar, ou seja descobrir o MAX_DZ, MAX_DY, MAX_DX
+            reward_sum = 0
+            reward_sum += 0.33 * (dx > 0) # incentivizes approaching in x
+            reward_sum += 0.33 * (dy > 0) # incentivizes approaching in y
+            reward_sum += 0.33 * (dz > 0) # incentivizes approaching in z # TODO beneficiar mais altura? (aumentar o ganho kz?)
+            self.cumulative_reward += reward_sum
+            return torch.tensor([reward_sum], dtype=torch.float32).to(self.device)
+
+    def log_metrics(self): # TODO this can be put in class RL
+        global timestamp
+        """ CSV log """
+        avg_reward = (self.cumulative_reward / self.counter_steps).item()
+        with open(os.path.join(self._run_path, 'metrics_' + timestamp + '.csv'), 'a', newline='') as metrics_file:
+            writer = csv.writer(metrics_file)
+            writer.writerow([avg_reward,self.num_landings,self.num_crashes])
+        """ Wandb log """
+        if self.params['log']:
+            self.run.log({"avg reward": avg_reward, "num_landings": self.num_landings, "num_crashes": self.num_crashes, "epsilon": self.epsilon})
+        return avg_reward
+
+    # TODO abstract this for all agents
+    """ Returns if terminated flag and the reason """
+    def terminated(self, state, action, next_state):
+        x_pos, y_pos, z_pos = self.world_ptr.cur_position[0], self.world_ptr.cur_position[1], self.world_ptr.cur_position[2] # get already updated next positions
+
+        # if max steps
+        if self.counter_episodic_steps > self.MAX_STEPS:
+            return torch.tensor([True]), "max_steps"
+        
+        # if out of allowed area
+        if abs(x_pos) > self.MAX_X or abs(y_pos) > self.MAX_Y or z_pos > self.MAX_Z or z_pos <= 0:
+            return torch.tensor([True]), "outside"
+
+        # if artuga is outside the field of view
+        dist_to_marker = np.abs(self.world_ptr.cur_position)[:2] - np.abs(self.world_ptr.landing_target_position)[:2]
+        if any(dist_to_marker > self.FIELD_OF_VIEW_THRESHOLD):
+            return torch.tensor([True]), "outside_fov"
+        
+        # if crashed
+        if (z_pos < self.CRITICAL_HEIGHT_MIN or z_pos <= 0) and ((abs(state[0]) > self.LANDED_ALLOWED_DIAMETER) or (abs(state[1]) > self.LANDED_ALLOWED_DIAMETER)):
+            return torch.tensor([True]), "crashed"
+        
+        # if landed
+        if (z_pos < self.CRITICAL_HEIGHT_MIN) and (abs(state[0]) < self.LANDED_ALLOWED_DIAMETER) and (abs(state[1]) < self.LANDED_ALLOWED_DIAMETER):
+            return torch.tensor([True]), "landed"
+
+        return torch.tensor([False]), "none"
+    
+    """ Compute advantage estimates using GAE """
+    def compute_advantages(self, rewards, values, next_value, done):
+        advantages = []
+        gae = 0
+
+        for step in reversed(range(len(rewards))):
+            delta = rewards[step] + self.gamma * next_value * (1 - done[step]) - values[step]
+            gae = delta + self.gamma * self.lam * (1 - done[step]) * gae
+            advantages.insert(0, gae)
+            next_value = values[step]
+
+        return advantages
+    
+    def learn(self):
+        if len(self.memory) < self.batch_size:
+            print('Not enough samples to learn')
+            return
+        
+        """ Get interactions """
+        states, actions, rewards, log_probs, values, terminations = self.memory.load(device=self.device, remove=True)
+        
+        for _ in range(self.update_epochs):
+            inds = self.memory.get_shuffled_inds()
+            for start in range(0,self.memory.batch_size,self.memory.minibatch_size):
+                continue # TODO remove this
+                end = start + self.memory.minibatch_size
+                rng = inds[start:end]
+
+                """ Slice minibatches """
+                mb_states = states[rng]
+                mb_actions = actions[rng]
+                mb_rewards = rewards[rng]
+                mb_log_probs = log_probs[rng]
+                mb_values = values[rng]
+                mb_terminations = terminations[rng]
+
+                """ Get next value from last observed state """
+                next_value = self.value_net(mb_states[-1]).item() # TODO this is maybe wrong (idxs are not sequential e.g., 5,8,3,2)
+
+                """ Get returns (gae gives advantages) """
+                advantages = self.compute_advantages(mb_rewards, mb_values, next_value, mb_terminations.int())
+                advantages = torch.tensor(advantages).view(-1,1).to(self.device)
+                returns = advantages + mb_values
+
+                """ Policy loss """
+                new_log_probs = torch.log_softmax(self.policy_net(mb_states), dim=-1) # log_softmax = log(softmax(logits))
+                new_log_probs = new_log_probs.gather(1, mb_actions).squeeze()
+                ratio = torch.exp(new_log_probs - mb_log_probs)
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                """ Critic loss """
+                value_loss = nn.MSELoss()(self.value_net(mb_states), returns)
+
+                """ Total loss: l = pl + 0.5 * vl - ec * entropy """
+                entropy = -torch.mean(torch.sum(torch.softmax(new_log_probs, dim=-1) * new_log_probs, dim=-1))
+                loss = policy_loss + 0.5 * value_loss - self.entropy_coeff * entropy
+
+                """ Perform backpropagation """
+                self.optimizer.zero_grad()
+                loss.backward(retain_graph=True) # TODO solve here the inplace error
+                self.optimizer.step()
+
+    def decide(self, state):
+        return self.select_action(state, train=True)
+
+    def test(self):
+        raise NotImplementedError
+
+    def train(self, state, decision, next_state, prev_pos, next_pos):
+        """ Update some metric variables """
+        self.counter_steps += 1
+        self.counter_episodic_steps += 1
+
+        """ Disambiguation of decision """
+        (action, log_prob), value = decision
+        
+        """ Check termination """
+        termination = self.terminated(state, action, next_state)
+        
+        """ Get reward """
+        reward = self.compute_reward(state, action, next_state, termination, prev_pos, next_pos)
+
+        """ Store experience """
+        self.store(state, action, reward, log_prob, value, termination)
+
+        print(f'# EPISODE {self.num_episodes} | step {self.counter_steps}')
+        print('state: ', state, 'action: ', action, 'next state: ', next_state, 
+              'reward: ', reward, 'termination: ', termination, 'landing target', self.world_ptr.landing_target_position,'\n')
+
+        """ 9. If so, reset episode"""
+        if termination[0].item():
+            """ Learn """
+            self.learn()
+
+            """ 9.1. Log metrics """
+            avg_reward = self.log_metrics() # log avg reward, num crashes, num lands, epsilon
+
+            self.num_episodes += 1 # increment num of episodes
+            self.counter_episodic_steps = 0 # reset counter episodic steps
+
+            """ 9.2. Save last model """
+            """ Save main policy """
+            torch.save({
+            'episode': self.counter_episodic_steps,
+            'model_state_dict': self.policy_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            }, self._last_model_path)
+
+            """ Save target policy """
+            torch.save({
+            'episode': self.counter_episodic_steps,
+            'model_state_dict': self.value_net.state_dict(),
+            }, self._last_target_model_path)
+
+            """ 9.3. Save best model if reward is the best """
+            if avg_reward > self.max_reward:
+                """ Save main policy """
+                torch.save({
+                'episode': self.counter_episodic_steps,
+                'model_state_dict': self.policy_net.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                }, self._best_model_path)
+
+                """ Save target policy """
+                torch.save({
+                'episode': self.counter_episodic_steps,
+                'model_state_dict': self.value_net.state_dict(),
+                }, self._best_target_model_path)
+                self.max_reward = avg_reward
+
+            self.reset() # decays epsilon and new landing target
+            return (termination[0], termination[1]) # returns termination cause and new marker position
+
+        if self.num_episodes == self.max_episodes:
+            print('Ended Learning')
+            return (termination[0], termination[1], self.landing_target_position) # returns termination cause and new marker position
+        
+        return (termination[0], termination[1]) # returns termination cause and new marker position # what returns if everything is ok
+    
+    def __call__(self):
+        if self.to_train:
+            return self.train()
+        else:
+            return self.test()
 
 """ TODO where to put illegal actions """
 action_opposition_matrix = np.array([[0,1,0,0,0,0,0,1,1],
