@@ -74,12 +74,12 @@ class RolloutBuffer:
     
     """ Return samples of memory deque and clear deque if remove=True """
     def load(self, device, remove=True):
-        batch_state = torch.vstack([interaction.cur_state for interaction in self.memory]).to(device)
-        batch_action = torch.vstack([interaction.action for interaction in self.memory]).to(device)
-        batch_reward = torch.vstack([interaction.reward for interaction in self.memory]).to(device)
-        batch_log_prob = torch.vstack([interaction.log_prob for interaction in self.memory]).to(device)
-        batch_value = torch.vstack([interaction.value for interaction in self.memory]).to(device)
-        batch_termination = torch.vstack([interaction.termination[0] for interaction in self.memory]).to(device)
-        if remove: 
+        batch_state = torch.vstack([interaction.cur_state for interaction in self.memory]).to(device).clone()
+        batch_action = torch.vstack([interaction.action for interaction in self.memory]).to(device).clone()
+        batch_reward = torch.vstack([interaction.reward for interaction in self.memory]).to(device).clone()
+        batch_log_prob = torch.vstack([interaction.log_prob for interaction in self.memory]).to(device).clone()
+        batch_value = torch.vstack([interaction.value for interaction in self.memory]).to(device).clone()
+        batch_termination = torch.vstack([interaction.termination[0] for interaction in self.memory]).to(device).clone()
+        if remove:
             self.memory.clear()
         return batch_state, batch_action, batch_reward, batch_log_prob, batch_value, batch_termination

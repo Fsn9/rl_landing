@@ -328,7 +328,7 @@ class Lander(ROS2Controller):
             self.act(*self.agent.action_space[decision.item()])
         elif self.params['agent'] == 'ppo':
             self.act(*self.agent.action_space[decision[0].item()])
-            decision = decision, self.agent.value_net(embeddings) # ((action_idx, action_prob), value)
+            decision = decision, self.agent.evaluate(state=embeddings, grad=False) # ((action_idx, action_prob), value)
         elif self.params['agent'] == 'sac':
             pass
 
@@ -570,7 +570,7 @@ class DQN(RL):
         self.epsilon_decay = -self.epsilon_i / self.final_episode_epsilon_decay
         
         self.memory_capacity = 1000
-        self.batch_size = 2
+        self.batch_size = 4
         self.memory = ReplayMemory(self.memory_capacity, self.batch_size)
 
         """ If test or resume args active, load models """
@@ -590,7 +590,7 @@ class DQN(RL):
         self.counter_steps = 0
         self.counter_episodic_steps = 0
         self.num_episodes = 0
-        self.MAX_STEPS = 50
+        self.MAX_STEPS = 10
         self.MAX_X = 8
         self.MAX_Y = 8
         self.MAX_Z = 8
@@ -711,6 +711,7 @@ class DQN(RL):
         return torch.tensor([False]), "none"
     
     def learn(self):
+        print('def __learn__')
         if len(self.memory) < self.batch_size:
             print('Not enough samples to learn')
             return
@@ -728,30 +729,37 @@ class DQN(RL):
             next_state_batch.append(interaction.next_state)
             reward_batch.append(interaction.reward)
             termination_batch.append(interaction.termination[0])
-        state_batch = torch.stack(state_batch, dim=0).to(self.device)
-        action_batch = torch.stack(action_batch, dim=0).to(self.device)
-        reward_batch = torch.stack(reward_batch, dim=0).to(self.device)
-        termination_batch = torch.stack(termination_batch, dim=0).to(self.device)
+        state_batch = torch.stack(state_batch, dim=0).to(self.device) # shape (B,S)
+        action_batch = torch.stack(action_batch, dim=0).to(self.device) # shape (B,1)
+        reward_batch = torch.stack(reward_batch, dim=0).to(self.device).squeeze(dim=1) # shape (B)
+        termination_batch = torch.stack(termination_batch, dim=0).to(self.device).squeeze(dim=1) # shape (B)
         #termination_batch[0] = True # TODO remove
-        non_terminated_idxs = (termination_batch.squeeze(dim=1) == False).nonzero().squeeze(dim=1) # squeeze because it delivers (B,1). I want (B,)
+        non_terminated_idxs = (termination_batch == False).nonzero().squeeze(dim=1) # squeeze because it delivers (B,1). I want (B,)
+        print('nti', non_terminated_idxs, non_terminated_idxs.shape)
 
         self.main_net.train()
 
-        """ Get Qs """
-        # The idea is feeding the *state* from the batch and then select the Q according to the *action* taken
-        predicted_qs = self.main_net(state_batch)
-        selected_qs = torch.gather(predicted_qs, dim=1, index=action_batch) # selected action values according to batch
+        """ 
+        Get Qs
+        The idea is feeding the *state* from the batch and then select the Q according to the *action* taken
+        """
+        predicted_qs = self.main_net(state_batch) # shape (B,A)
+        selected_qs = torch.gather(predicted_qs, dim=1, index=action_batch) # selected action values according to batch, shape (B,1)
+        print('predicted_qs: ', predicted_qs)
+        print('selected_qs: ', predicted_qs)
         
         """ Get Q targets """
         next_qs = torch.zeros(self.batch_size).to(device=self.device) # max
         with torch.no_grad():
             target_qs = self.target_net(state_batch[non_terminated_idxs]) # this variable is useful to create just for interpretability
             next_qs[non_terminated_idxs] = target_qs.max(1).values # assign max qs to idxs of non terminal states. the others remain equal to zero.
+        print('target_qs: ', target_qs)
+        print('max_qs: ', predicted_qs)
 
         """ Compute loss """
         # The update is Q = Q + alpha * (r + gamma * max Q - Q)
-        td_target = reward_batch + self.gamma * next_qs
-        loss = self.criterion(selected_qs, td_target.unsqueeze(1)) # target shape (8) to (8,1)
+        td_target = reward_batch + self.gamma * next_qs # shape: (B)
+        loss = self.criterion(selected_qs, td_target.unsqueeze(dim=-1)) # target shape (8) to (8,1)
         self.optimizer.zero_grad()
         loss.backward(retain_graph=True)
 
@@ -938,32 +946,33 @@ class PPO(RL):
         self.policy_net = OneLayerMLP(self.input_size, self.output_size).to(self.device)
         self.value_net = OneLayerMLP(self.input_size, 1).to(self.device) # output is V(s)
 
-        self.optimizer = optim.AdamW(list(self.policy_net.parameters()) + list(self.value_net.parameters()), lr=self.learning_rate)
-        # TODO perceber se o optimizer monitoriza os parametros das duas
-        ## 2 forwards e optimizer com as duas redes juntas
-        ## 2 optimizers, um por rede
+        self.optimizer_actor = optim.AdamW(self.policy_net.parameters(), lr=self.learning_rate)
+        self.optimizer_critic = optim.AdamW(self.value_net.parameters(), lr=self.learning_rate)
 
-        # TODO criar variavel self.capacity
+        self.criterion_critic = nn.MSELoss()
+
         self.memory = RolloutBuffer(capacity=self.batch_size, minibatch_size=self.minibatch_size)
 
         """ If test or resume args active, load models """
-        if self.model_path:
+        if self.model_path: # TODO Correct this to critic.pth and actor.pth
             self.loaded_model = torch.load(self.model_path, weights_only=False) # This loads object
-            self.main_net.load_state_dict(self.loaded_model['model_state_dict'])
+            self.policy_net.load_state_dict(self.loaded_model['model_state_dict'])
             print(f'Loaded main model ({self.model_path})')
 
             self.loaded_target_model = torch.load(self.best_target_model_path, weights_only=False)
-            self.target_net.load_state_dict(self.loaded_target_model['model_state_dict'])
+            self.value_net.load_state_dict(self.loaded_target_model['model_state_dict'])
             print(f'Loaded target model ({self.best_target_model_path})')
             
-            self.optimizer.load_state_dict(self.loaded_model['optimizer_state_dict'])
-            print(f'Loaded optimizer model ({self.optimizer})')
+            self.optimizer_actor.load_state_dict(self.loaded_model['optimizer_state_dict'])
+            print(f'Loaded optimizer actor ({self.optimizer_actor})')
+            self.optimizer_critic.load_state_dict(self.loaded_model['optimizer_state_dict'])
+            print(f'Loaded optimizer critic ({self.optimizer_critic})')
 
         """ Metrics """ # TODO put this in config
         self.counter_steps = 0
         self.counter_episodic_steps = 0
         self.num_episodes = 0
-        self.MAX_STEPS = 50
+        self.MAX_STEPS = 10
         self.MAX_X = 8
         self.MAX_Y = 8
         self.MAX_Z = 8
@@ -1096,68 +1105,81 @@ class PPO(RL):
     def compute_advantages(self, rewards, values, next_value, done):
         advantages = []
         gae = 0
+        values = torch.cat((values,next_value.unsqueeze(dim=-1)))
 
         for step in reversed(range(len(rewards))):
-            delta = rewards[step] + self.gamma * next_value * (1 - done[step]) - values[step]
-            gae = delta + self.gamma * self.lam * (1 - done[step]) * gae
+            delta = rewards[step] + self.gamma * values[step+1] * (1 - done[step].item()) - values[step]
+            gae = delta + self.gamma * self.lam * (1 - done[step].item()) * gae
             advantages.insert(0, gae)
-            next_value = values[step]
+            #next_value = values[step]
 
         return advantages
     
-    def learn(self):
+    def learn(self, next_state):
         if len(self.memory) < self.batch_size:
             print('Not enough samples to learn')
             return
         
-        """ Get interactions """
+        """ 
+            Get interactions 
+            note: Only states are not detached (because they contain gradients from the detector)
+        """
         states, actions, rewards, log_probs, values, terminations = self.memory.load(device=self.device, remove=True)
+
+        """ Get next value from last observed state """
+        next_value = self.evaluate(next_state,grad=False) # this value is detached (grad = False)
+
+        """ Get returns (gae gives advantages) """
+        advantages = self.compute_advantages(rewards, values, next_value, terminations)
+        advantages = torch.tensor(advantages).view(-1,1).to(self.device)
+        returns = advantages + values # These must be detached from main graph
         
         for _ in range(self.update_epochs):
             inds = self.memory.get_shuffled_inds()
-            for start in range(0,self.memory.batch_size,self.memory.minibatch_size):
-                continue # TODO remove this
+            for start in range(0,self.memory.batch_size,self.memory.minibatch_size): # update per minibatch
                 end = start + self.memory.minibatch_size
                 rng = inds[start:end]
 
                 """ Slice minibatches """
                 mb_states = states[rng]
+                mb_states_critic = mb_states.clone().detach() # the critic detaches gradients accumulated by the detector
                 mb_actions = actions[rng]
-                mb_rewards = rewards[rng]
                 mb_log_probs = log_probs[rng]
-                mb_values = values[rng]
-                mb_terminations = terminations[rng]
-
-                """ Get next value from last observed state """
-                next_value = self.value_net(mb_states[-1]).item() # TODO this is maybe wrong (idxs are not sequential e.g., 5,8,3,2)
-
-                """ Get returns (gae gives advantages) """
-                advantages = self.compute_advantages(mb_rewards, mb_values, next_value, mb_terminations.int())
-                advantages = torch.tensor(advantages).view(-1,1).to(self.device)
-                returns = advantages + mb_values
+                mb_advantages = advantages[rng]
+                mb_returns = returns[rng]
 
                 """ Policy loss """
-                new_log_probs = torch.log_softmax(self.policy_net(mb_states), dim=-1) # log_softmax = log(softmax(logits))
-                new_log_probs = new_log_probs.gather(1, mb_actions).squeeze()
+                new_log_probs_ = torch.log_softmax(self.policy_net(mb_states), dim=-1) # log_softmax = log(softmax(logits))
+                new_log_probs = new_log_probs_.gather(1, mb_actions).squeeze()
                 ratio = torch.exp(new_log_probs - mb_log_probs)
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
+                surr1 = ratio * mb_advantages
+                surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * mb_advantages
+                entropy = -torch.mean(torch.sum(torch.softmax(new_log_probs, dim=-1) * new_log_probs, dim=-1))
+                actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coeff * entropy
+                self.optimizer_actor.zero_grad()
+                actor_loss.backward(retain_graph=True)
+                self.optimizer_actor.step()
 
                 """ Critic loss """
-                value_loss = nn.MSELoss()(self.value_net(mb_states), returns)
+                critic_loss = self.criterion_critic(self.evaluate(mb_states_critic, grad=True), mb_returns) * 0.5
+                self.optimizer_critic.zero_grad()
+                critic_loss.backward()
+                self.optimizer_critic.step()
 
-                """ Total loss: l = pl + 0.5 * vl - ec * entropy """
-                entropy = -torch.mean(torch.sum(torch.softmax(new_log_probs, dim=-1) * new_log_probs, dim=-1))
-                loss = policy_loss + 0.5 * value_loss - self.entropy_coeff * entropy
-
-                """ Perform backpropagation """
-                self.optimizer.zero_grad()
-                loss.backward(retain_graph=True) # TODO solve here the inplace error
-                self.optimizer.step()
 
     def decide(self, state):
         return self.select_action(state, train=True)
+
+    def evaluate(self, state, grad=True):
+        if grad:
+            self.value_net.train()
+            return self.value_net(state)
+        else:
+            self.value_net.eval()
+            with torch.no_grad():
+                value = self.value_net(state) 
+                self.value_net.train()
+                return value
 
     def test(self):
         raise NotImplementedError
@@ -1186,7 +1208,7 @@ class PPO(RL):
         """ 9. If so, reset episode"""
         if termination[0].item():
             """ Learn """
-            self.learn()
+            self.learn(next_state=next_state) # Learns at the end of episode as monte carlo
 
             """ 9.1. Log metrics """
             avg_reward = self.log_metrics() # log avg reward, num crashes, num lands, epsilon
@@ -1195,32 +1217,34 @@ class PPO(RL):
             self.counter_episodic_steps = 0 # reset counter episodic steps
 
             """ 9.2. Save last model """
-            """ Save main policy """
+            """ Save actor net """
             torch.save({
             'episode': self.counter_episodic_steps,
             'model_state_dict': self.policy_net.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            'optimizer_state_dict': self.optimizer_actor.state_dict(),
             }, self._last_model_path)
 
-            """ Save target policy """
+            """ Save critic net """
             torch.save({
             'episode': self.counter_episodic_steps,
             'model_state_dict': self.value_net.state_dict(),
+            'optimizer_state_dict': self.optimizer_critic.state_dict(),
             }, self._last_target_model_path)
 
             """ 9.3. Save best model if reward is the best """
             if avg_reward > self.max_reward:
-                """ Save main policy """
+                """ Save actor net """
                 torch.save({
                 'episode': self.counter_episodic_steps,
                 'model_state_dict': self.policy_net.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
+                'optimizer_state_dict': self.optimizer_actor.state_dict(),
                 }, self._best_model_path)
 
-                """ Save target policy """
+                """ Save critic net """
                 torch.save({
                 'episode': self.counter_episodic_steps,
                 'model_state_dict': self.value_net.state_dict(),
+                'optimizer_state_dict': self.optimizer_critic.state_dict(),
                 }, self._best_target_model_path)
                 self.max_reward = avg_reward
 
